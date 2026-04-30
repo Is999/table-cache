@@ -1,6 +1,6 @@
 # tablecache
 
-`pkg/tablecache` 是一个框架无关的表数据缓存管理扩展包，参考 `laravel-admin` 的 `RedisService.php` 思路，把“缓存目标声明、数据回源、Redis 写入、刷新锁、TTL 抖动、空值占位”收口到统一组件中。
+`pkg/tablecache` 是一个框架无关的表数据缓存管理扩展包，把“缓存目标声明、数据回源、Redis 写入、刷新锁、TTL 抖动、空值占位”收口到统一组件中。
 
 ## 设计要点
 
