@@ -59,7 +59,7 @@ func TestManagerRefreshByKey(t *testing.T) {
 	if err := manager.RefreshByKey(ctx, "demo:404"); err != nil {
 		t.Fatalf("RefreshByKey(demo:404) error = %v", err)
 	}
-	if got := client.HGet(ctx, "demo:404", "value").Val(); got != DefaultEmptyMarker {
+	if got := client.HGet(ctx, "demo:404", hashEmptyMarkerField).Val(); got != DefaultEmptyMarker {
 		t.Fatalf("demo:404 empty marker = %q, want %q", got, DefaultEmptyMarker)
 	}
 }
@@ -271,7 +271,7 @@ func TestManagerReleaseLockSafely(t *testing.T) {
 				// 模拟当前持锁实例加载耗时超过锁 TTL，随后其它实例重新持有同一把锁。
 				server.FastForward(2 * time.Second)
 				if err := client.Set(ctx, manager.lockKey(params.Key), "other-owner", time.Minute).Err(); err != nil {
-					return nil, err
+					return nil, errors.Tag(err)
 				}
 				return []Entry{{Key: params.Key, Type: TypeString, Value: "ok"}}, nil
 			},
@@ -740,7 +740,7 @@ func TestManagerErrNotFoundWritesEmptyMarker(t *testing.T) {
 	if ok {
 		t.Fatalf("Get(missing:1) ok = true, want false")
 	}
-	if got := client.HGet(ctx, "missing:1", "value").Val(); got != DefaultEmptyMarker {
+	if got := client.HGet(ctx, "missing:1", hashEmptyMarkerField).Val(); got != DefaultEmptyMarker {
 		t.Fatalf("empty marker = %q, want %q", got, DefaultEmptyMarker)
 	}
 }
@@ -1226,7 +1226,7 @@ func TestManagerLoadThroughWithOptionsLoaderTimeout(t *testing.T) {
 			Type:  TypeString,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 				<-ctx.Done()
-				return nil, ctx.Err()
+				return nil, errors.Tag(ctx.Err())
 			},
 		},
 	})
@@ -1257,7 +1257,7 @@ func TestManagerLoadThroughWithOptionsIgnoreCancel(t *testing.T) {
 				cancel()
 				select {
 				case <-ctx.Done():
-					return nil, ctx.Err()
+					return nil, errors.Tag(ctx.Err())
 				case <-time.After(20 * time.Millisecond):
 				}
 				return []Entry{{Key: params.Key, Type: TypeString, Value: "ok"}}, nil
@@ -1604,7 +1604,7 @@ func TestManagerLoaderTimeout(t *testing.T) {
 			LoaderTimeout: 20 * time.Millisecond,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 				<-ctx.Done()
-				return nil, ctx.Err()
+				return nil, errors.Tag(ctx.Err())
 			},
 		},
 	})
@@ -1684,6 +1684,119 @@ func TestJitterDurationBounds(t *testing.T) {
 	}
 }
 
+// TestManagerDefaultWaitDelayBackoff 验证默认等待策略采用递增退避，降低热点轮询压力。
+func TestManagerDefaultWaitDelayBackoff(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "wait-backoff",
+			Title: "等待退避缓存",
+			Key:   "wait-backoff",
+			Type:  TypeString,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				return nil, nil
+			},
+		},
+	}, WithLockTTL(time.Second))
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	first := manager.waitDelay(Target{}, 0)
+	second := manager.waitDelay(Target{}, 1)
+	third := manager.waitDelay(Target{}, 2)
+	if !(first > 0 && second > first && third >= second) {
+		t.Fatalf("wait delays = %v, %v, %v, want increasing", first, second, third)
+	}
+	if got := manager.waitDelay(Target{}, 16); got != defaultWaitStepMax {
+		t.Fatalf("waitDelay capped = %v, want %v", got, defaultWaitStepMax)
+	}
+}
+
+// TestManagerConfiguredWaitKeepsFixedStep 验证显式 WithWait 配置时继续保持固定步长语义。
+func TestManagerConfiguredWaitKeepsFixedStep(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "wait-fixed",
+			Title: "固定等待缓存",
+			Key:   "wait-fixed",
+			Type:  TypeString,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				return nil, nil
+			},
+		},
+	}, WithWait(12*time.Millisecond, 5))
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	for attempt := 0; attempt < 4; attempt++ {
+		if got := manager.waitDelay(Target{}, attempt); got != 12*time.Millisecond {
+			t.Fatalf("waitDelay(attempt=%d) = %v, want 12ms", attempt, got)
+		}
+	}
+}
+
+// TestRedisStoreWriteBatchRetryableGuard 验证增量写场景不会被误判为可自动重试。
+func TestRedisStoreWriteBatchRetryableGuard(t *testing.T) {
+	if entriesRetryable([]Entry{{Key: "a", Type: TypeHash, Value: map[string]any{"a": "1"}, Overwrite: Bool(false)}}) {
+		t.Fatalf("entriesRetryable() = true, want false for overwrite=false")
+	}
+	if !entriesRetryable([]Entry{{Key: "a", Type: TypeHash, Value: map[string]any{"a": "1"}}}) {
+		t.Fatalf("entriesRetryable() = false, want true for default overwrite")
+	}
+}
+
+// BenchmarkManagerWaitDelay 衡量默认等待退避计算开销，确保不会成为热点路径负担。
+func BenchmarkManagerWaitDelay(b *testing.B) {
+	server := miniredis.RunT(b)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "bench-wait",
+			Title: "等待退避基准",
+			Key:   "bench-wait",
+			Type:  TypeString,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				return nil, nil
+			},
+		},
+	})
+	if err != nil {
+		b.Fatalf("NewManager() error = %v", err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = manager.waitDelay(Target{}, i%8)
+	}
+}
+
+// BenchmarkRefreshReadyName 衡量 fields 签名收敛开销，给热点读穿路径提供基础性能参考。
+func BenchmarkRefreshReadyName(b *testing.B) {
+	server := miniredis.RunT(b)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "bench-ready",
+			Title: "就绪标识基准",
+			Key:   "bench-ready:",
+			Type:  TypeString,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				return nil, nil
+			},
+		},
+	})
+	if err != nil {
+		b.Fatalf("NewManager() error = %v", err)
+	}
+	fields := []string{"name", "age", "status", "avatar", "department", "updated_at"}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = manager.refreshReadyName("bench-ready:1", fields)
+	}
+}
+
 // countingStore 统计 SetNX 调用次数，用于验证 singleflight 是否拦截本机并发。
 type countingStore struct {
 	Store      // 复用底层 RedisStore 的完整 Store 实现
@@ -1712,6 +1825,23 @@ func (s *lockLostStore) RefreshLock(ctx context.Context, key string, value strin
 // WriteBatch 统计批量写回次数，便于断言失锁后不会再写缓存。
 func (s *lockLostStore) WriteBatch(ctx context.Context, entries []Entry) error {
 	s.writeBatchCalls.Add(1)
+	return s.Store.WriteBatch(ctx, entries)
+}
+
+// flakyWriteStore 模拟首次批量写失败，验证可重试路径会自动再试一次。
+type flakyWriteStore struct {
+	Store
+	failuresLeft atomic.Int64
+	writeCalls   atomic.Int64
+}
+
+// WriteBatch 在剩余失败次数大于 0 时直接返回错误，模拟瞬时抖动。
+func (s *flakyWriteStore) WriteBatch(ctx context.Context, entries []Entry) error {
+	s.writeCalls.Add(1)
+	if s.failuresLeft.Load() > 0 {
+		s.failuresLeft.Add(-1)
+		return errors.Errorf("mock transient write failure")
+	}
 	return s.Store.WriteBatch(ctx, entries)
 }
 

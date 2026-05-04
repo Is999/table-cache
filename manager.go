@@ -3,10 +3,15 @@ package tablecache
 import (
 	"context"
 	"crypto/rand"
+	"io"
+
+	// sha1 仅用于对 fields 签名做长度收敛，避免生成超长 result key；不用于任何安全/加密场景。
+	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,8 +34,15 @@ const (
 	defaultScanCount = int64(100)
 	// defaultRebuildResultTTL 表示重建完成元信息默认保留时间。
 	defaultRebuildResultTTL = 30 * time.Second
+	// defaultPrefixEpochTTL 表示前缀全量刷新代际元信息默认保留时间，避免长期运行产生无限元信息堆积。
+	defaultPrefixEpochTTL = 7 * 24 * time.Hour
 	// defaultRefreshConcurrency 表示批量刷新默认并发度，1 表示保守串行。
 	defaultRefreshConcurrency = 1
+)
+
+const (
+	// hashEmptyMarkerField 表示 Hash 类型 visible 空值占位使用的保留字段名，避免与业务真实字段发生碰撞。
+	hashEmptyMarkerField = "__tablecache_empty__"
 )
 
 var (
@@ -58,6 +70,9 @@ type Manager struct {
 	store          Store                // store 是底层缓存存储适配器
 	targets        map[string]Target    // targets 按索引保存缓存目标
 	ordered        []Target             // ordered 保留配置顺序，便于列表展示和批量刷新
+	fixedKeys      map[string]Target    // fixedKeys 用于加速固定 key 的精确匹配
+	prefixTargets  []Target             // prefixTargets 仅包含前缀型目标，并按 key 长度降序排列以确保最长前缀优先
+	prefixTargetsM map[string]Target    // prefixTargetsM 用于 DeleteByPrefix 等场景快速校验前缀是否已注册
 	lockTTL        time.Duration        // lockTTL 是缓存重建锁持有时间
 	waitStep       time.Duration        // waitStep 是等待其它实例重建时的轮询间隔
 	waitTimes      int                  // waitTimes 是等待其它实例重建的最大次数
@@ -67,6 +82,7 @@ type Manager struct {
 	scanCount      int64                // scanCount 是清理前缀缓存时的 SCAN count
 	lockRenew      time.Duration        // lockRenew 是缓存重建锁续期间隔，0 表示按 lockTTL 自动计算
 	resultTTL      time.Duration        // resultTTL 是重建完成元信息保留时间
+	prefixEpochTTL time.Duration        // prefixEpochTTL 是前缀全量刷新代际元信息保留时间
 	loaderTTL      time.Duration        // loaderTTL 是默认 Loader 超时时间，0 表示不额外设置超时
 	ctxPolicy      RebuildContextPolicy // ctxPolicy 是缓存重建上下文取消策略
 	concurrency    int                  // concurrency 是批量刷新并发度
@@ -98,16 +114,20 @@ func NewManager(store Store, targets []Target, opts ...Option) (*Manager, error)
 		return nil, errors.Errorf("tablecache store不能为空")
 	}
 	manager := &Manager{
-		store:       store,
-		targets:     make(map[string]Target, len(targets)),
-		ordered:     make([]Target, 0, len(targets)),
-		lockTTL:     defaultLockTTL,
-		emptyMarker: DefaultEmptyMarker,
-		emptyTTL:    defaultEmptyTTL,
-		scanCount:   defaultScanCount,
-		resultTTL:   defaultRebuildResultTTL,
-		concurrency: defaultRefreshConcurrency,
-		decoder:     json.Unmarshal,
+		store:          store,
+		targets:        make(map[string]Target, len(targets)),
+		ordered:        make([]Target, 0, len(targets)),
+		fixedKeys:      make(map[string]Target, len(targets)),
+		prefixTargets:  make([]Target, 0, len(targets)),
+		prefixTargetsM: make(map[string]Target, len(targets)),
+		lockTTL:        defaultLockTTL,
+		emptyMarker:    DefaultEmptyMarker,
+		emptyTTL:       defaultEmptyTTL,
+		scanCount:      defaultScanCount,
+		resultTTL:      defaultRebuildResultTTL,
+		prefixEpochTTL: defaultPrefixEpochTTL,
+		concurrency:    defaultRefreshConcurrency,
+		decoder:        json.Unmarshal,
 	}
 	for _, opt := range opts {
 		opt(manager)
@@ -115,10 +135,10 @@ func NewManager(store Store, targets []Target, opts ...Option) (*Manager, error)
 	for _, target := range targets {
 		normalized, err := normalizeTarget(target, manager.emptyTTL)
 		if err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		if err := manager.registerTarget(normalized); err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 	}
 	return manager, nil
@@ -147,6 +167,15 @@ func WithRebuildResultTTL(ttl time.Duration) Option {
 	return func(manager *Manager) {
 		if ttl > 0 {
 			manager.resultTTL = ttl
+		}
+	}
+}
+
+// WithPrefixEpochTTL 设置前缀全量刷新代际元信息保留时间。
+func WithPrefixEpochTTL(ttl time.Duration) Option {
+	return func(manager *Manager) {
+		if ttl > 0 {
+			manager.prefixEpochTTL = ttl
 		}
 	}
 }
@@ -274,7 +303,7 @@ func (m *Manager) IsFixedKey(key string) bool {
 // RefreshAll 刷新全部允许批量重建的缓存目标。
 func (m *Manager) RefreshAll(ctx context.Context) error {
 	_, _, err := m.RefreshAllWithSummary(ctx)
-	return err
+	return errors.Tag(err)
 }
 
 // RefreshAllDetailed 刷新全部允许批量重建的缓存目标，并逐项返回执行结果。
@@ -311,7 +340,7 @@ func (m *Manager) RefreshAllWithSummary(ctx context.Context) ([]RefreshBatchResu
 	m.recordRefreshBatch(ctx, "all", summary)
 	m.logInfoEvent("refresh_all_done", "", "", "result", refreshBatchResultLabel(summary), "total", summary.Total, "success", summary.Success, "failed", summary.Failed)
 	if summary.HasError() {
-		return results, summary, &RefreshBatchError{Summary: summary}
+		return results, summary, errors.Tag(&RefreshBatchError{Summary: summary})
 	}
 	return results, summary, nil
 }
@@ -320,7 +349,7 @@ func (m *Manager) RefreshAllWithSummary(ctx context.Context) ([]RefreshBatchResu
 func (m *Manager) RefreshByKey(ctx context.Context, key string, fields ...string) error {
 	target, params, err := m.resolve(key, fields)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	return m.refreshWithSingleflight(ctx, target, params.Key, params.Fields, refreshOptions{requested: true})
 }
@@ -328,7 +357,7 @@ func (m *Manager) RefreshByKey(ctx context.Context, key string, fields ...string
 // RefreshByKeys 批量刷新多个缓存 key；同 key 会自动去重。
 func (m *Manager) RefreshByKeys(ctx context.Context, keys []string) error {
 	_, _, err := m.RefreshByKeysWithSummary(ctx, keys)
-	return err
+	return errors.Tag(err)
 }
 
 // RefreshByKeysDetailed 批量刷新多个缓存 key，并逐项返回执行结果。
@@ -380,7 +409,7 @@ func (m *Manager) RefreshByKeysWithSummary(ctx context.Context, keys []string) (
 func (m *Manager) Get(ctx context.Context, key string, dest any) (bool, error) {
 	result, err := m.GetState(ctx, key, dest)
 	if err != nil {
-		return false, err
+		return false, errors.Tag(err)
 	}
 	return result.State == LookupStateHit, nil
 }
@@ -389,7 +418,7 @@ func (m *Manager) Get(ctx context.Context, key string, dest any) (bool, error) {
 func (m *Manager) GetState(ctx context.Context, key string, dest any) (LookupResult, error) {
 	target, params, err := m.resolve(key, nil)
 	if err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	return m.lookup(ctx, target, params, dest)
 }
@@ -470,7 +499,7 @@ func (m *Manager) DeleteByKey(ctx context.Context, key string) error {
 		return nil
 	}
 	if _, _, err := m.resolve(key, nil); err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	return m.store.Delete(ctx, key, m.emptyKey(key), m.rebuildResultKey(key))
 }
@@ -483,7 +512,7 @@ func (m *Manager) DeleteByPrefix(ctx context.Context, prefix string) error {
 	}
 	target, err := m.resolvePrefixTarget(prefix)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	patterns := []string{
 		target.Key + "*",
@@ -506,11 +535,11 @@ func (m *Manager) DeleteByPrefix(ctx context.Context, prefix string) error {
 func (m *Manager) getOrRefresh(ctx context.Context, key string, dest any, options LoadThroughOptions) (LookupResult, error) {
 	target, params, err := m.resolve(key, options.Fields)
 	if err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	result, err := m.lookup(ctx, target, params, dest)
 	if err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	if result.State != LookupStateMiss {
 		return result, nil
@@ -522,11 +551,11 @@ func (m *Manager) getOrRefresh(ctx context.Context, key string, dest any, option
 		contextPolicy: options.ContextPolicy,
 	}
 	if err := m.refreshWithSingleflight(ctx, target, params.Key, params.Fields, refreshOptions); err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	refreshedResult, err := m.lookup(m.buildReadbackContext(ctx, options.ContextPolicy), target, params, dest)
 	if err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	refreshedResult.Refreshed = true
 	return refreshedResult, nil
@@ -569,14 +598,11 @@ func (m *Manager) mergeBatchLoadThroughOptions(defaultOptions LoadThroughOptions
 
 // refreshWithSingleflight 合并同一进程内相同 key 的并发刷新请求。
 func (m *Manager) refreshWithSingleflight(ctx context.Context, target Target, key string, fields []string, options refreshOptions) error {
-	flightKey := "refresh:" + key
-	if len(fields) > 0 {
-		flightKey += "|fields:" + strings.Join(fields, ",")
-	}
+	flightKey := "refresh:" + m.refreshReadyName(key, fields)
 	_, err, _ := m.group.Do(flightKey, func() (any, error) {
 		return nil, m.refreshTarget(ctx, target, key, fields, options)
 	})
-	return err
+	return errors.Tag(err)
 }
 
 // refreshTarget 在锁保护下回源并写入缓存，避免热点缓存击穿。
@@ -589,22 +615,20 @@ func (m *Manager) refreshTarget(ctx context.Context, target Target, key string, 
 	if target.Loader == nil {
 		return ErrLoaderRequired
 	}
+	refreshCtx := m.buildRefreshContext(ctx, options.contextPolicy)
+	fieldsReadyName := m.refreshFieldsReadyName(key, fields)
 	for {
-		if err := m.waitPrefixRefreshIdle(ctx, target, key); err != nil {
+		if err := m.waitPrefixRefreshIdle(refreshCtx, target, key); err != nil {
 			metricResult = "wait_error"
-			return err
+			return errors.Tag(err)
 		}
-		lockName := m.refreshLockName(target, key)
-		lockKey := m.lockKey(lockName)
-		lockValue := ""
-		lockValue = newLockValue()
-		locked, err := m.store.SetNX(ctx, lockKey, lockValue, m.lockTTL)
+		lockName, lockKey, lockValue, locked, err := m.acquireRefreshLock(refreshCtx, target, key)
 		if err != nil {
-			return err
+			return errors.Tag(err)
 		}
 		if !locked {
 			m.recordLockFailed(ctx, target.Index)
-			outcome, waitErr := m.waitRebuilt(ctx, target, key, lockName)
+			outcome, waitErr := m.waitRefreshRebuilt(refreshCtx, target, key, lockName, fieldsReadyName)
 			if waitErr != nil {
 				metricResult = "wait_error"
 				return waitErr
@@ -615,107 +639,14 @@ func (m *Manager) refreshTarget(ctx context.Context, target Target, key string, 
 			}
 			continue
 		}
-		err = func() error {
-			baseRebuildCtx, cancel := m.buildRebuildContext(ctx, target, options.contextPolicy)
-			defer cancel()
-			rebuildCtx, cancelCause := context.WithCancelCause(baseRebuildCtx)
-			defer cancelCause(nil)
-			stopRenew := m.startLockRenew(rebuildCtx, lockKey, lockValue, cancelCause)
-			defer func() {
-				stopRenew()
-				_, _ = m.store.ReleaseLock(context.WithoutCancel(ctx), lockKey, lockValue)
-			}()
-
-			prefixEpoch, err := m.preparePrefixRefreshEpoch(rebuildCtx, target, key)
-			if err != nil {
-				return err
-			}
-			params := m.loadParams(target, key, fields)
-			wroteHiddenEmptyMarker := false
-			entries, err := target.Loader(rebuildCtx, params)
-			if err != nil {
-				if cause := context.Cause(rebuildCtx); cause != nil {
-					return cause
-				}
-				if !errors.Is(err, ErrNotFound) {
-					m.recordLoaderError(ctx, target.Index, err)
-					return err
-				}
-				entries = nil
-			}
-			if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
-				return err
-			}
-			if len(entries) == 0 && target.AllowEmptyMarker && options.requested {
-				if target.VisibleEmptyMark {
-					entries = []Entry{m.emptyEntry(target, key)}
-				} else {
-					if err := m.writeHiddenEmptyMarker(rebuildCtx, target, key); err != nil {
-						return err
-					}
-					wroteHiddenEmptyMarker = true
-					m.recordEmptyMarkerWrite(ctx, target.Index)
-				}
-			}
-			if strings.HasSuffix(target.Key, ":") && key == target.Key {
-				// 前缀目标做全量刷新时先清理旧 key，避免删除源数据中已不存在的脏缓存。
-				if err := m.DeleteByPrefix(rebuildCtx, target.Key); err != nil {
-					return err
-				}
-			}
-			if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
-				return err
-			}
-			for index, entry := range entries {
-				entries[index] = m.withTargetDefaults(target, entry)
-			}
-			if len(entries) > 0 {
-				emptyKeys := make([]string, 0, len(entries))
-				for _, entry := range entries {
-					if strings.TrimSpace(entry.Key) == "" {
-						continue
-					}
-					emptyKeys = append(emptyKeys, m.emptyKey(entry.Key))
-				}
-				if len(emptyKeys) > 0 {
-					if err := m.store.Delete(rebuildCtx, emptyKeys...); err != nil {
-						return err
-					}
-				}
-				if err := m.store.WriteBatch(rebuildCtx, entries); err != nil {
-					return err
-				}
-				m.recordRefreshEntryCount(ctx, target.Index, len(entries))
-			}
-			if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
-				return err
-			}
-			if len(entries) == 0 && wroteHiddenEmptyMarker {
-				if err := m.deleteBusinessKey(rebuildCtx, target, key); err != nil {
-					return err
-				}
-			}
-			if len(entries) == 0 && !wroteHiddenEmptyMarker && (!target.AllowEmptyMarker || !options.requested || !target.VisibleEmptyMark) {
-				if err := m.deleteRefreshedKey(rebuildCtx, target, key); err != nil {
-					return err
-				}
-			}
-			if err := m.markRebuildResult(rebuildCtx, key); err != nil {
-				if m.logger != nil {
-					m.logger.Warnf("tablecache写入重建结果元信息失败 key=%s err=%v", key, err)
-				}
-			}
-			if len(entries) == 1 && target.AllowEmptyMarker && options.requested && target.VisibleEmptyMark {
-				m.recordEmptyMarkerWrite(ctx, target.Index)
-			}
-			if len(entries) == 0 {
-				m.recordRefreshEntryCount(ctx, target.Index, 0)
-			}
-			return nil
-		}()
+		err = m.executeRefreshWithLock(ctx, refreshCtx, target, key, fields, options, lockKey, lockValue, fieldsReadyName)
 		if errors.Is(err, errPrefixRefreshBusy) {
 			m.recordPrefixRetry(ctx, target.Index)
 			m.logInfoEvent("prefix_retry", target.Index, key, "lock_name", lockName)
+			// 避免在前缀全量刷新期间 tight loop 自旋抢锁，对 Redis 与 CPU 造成无意义压力。
+			if err := waitWithContext(refreshCtx, m.waitDelay(target, 0)); err != nil {
+				return errors.Tag(err)
+			}
 			continue
 		}
 		if errors.Is(err, ErrRefreshLockLost) {
@@ -723,51 +654,251 @@ func (m *Manager) refreshTarget(ctx context.Context, target Target, key string, 
 			m.logWarnEvent("lock_lost", target.Index, key, "lock_name", lockName, "err", err)
 		}
 		if err != nil {
-			return err
+			return errors.Tag(err)
 		}
 		metricResult = "success"
 		return nil
 	}
+}
+
+// buildRefreshContext 构建单次刷新过程使用的基础上下文。
+func (m *Manager) buildRefreshContext(ctx context.Context, override *RebuildContextPolicy) context.Context {
+	if m.effectiveRebuildContextPolicy(override) == RebuildContextIgnoreCancel {
+		return context.WithoutCancel(ctx)
+	}
+	return ctx
+}
+
+// refreshFieldsReadyName 返回 fields 级等待判定名称；无 fields 时直接返回空字符串。
+func (m *Manager) refreshFieldsReadyName(key string, fields []string) string {
+	if len(fields) == 0 {
+		return ""
+	}
+	// fieldsReadyName 用于 fields 级并发等待判定；基础锁域仍以 key 为粒度，避免不同 fields 同时写回造成覆盖。
+	return m.refreshReadyName(key, fields)
+}
+
+// acquireRefreshLock 为当前刷新请求申请分布式锁，并返回锁相关元信息。
+func (m *Manager) acquireRefreshLock(ctx context.Context, target Target, key string) (string, string, string, bool, error) {
+	lockName := m.refreshLockName(target, key)
+	lockKey := m.lockKey(lockName)
+	lockValue := newLockValue()
+	locked, err := m.store.SetNX(ctx, lockKey, lockValue, m.lockTTL)
+	return lockName, lockKey, lockValue, locked, errors.Tag(err)
+}
+
+// waitRefreshRebuilt 等待其它实例完成当前 key 的缓存重建。
+func (m *Manager) waitRefreshRebuilt(ctx context.Context, target Target, key string, lockName string, fieldsReadyName string) (waitRebuildOutcome, error) {
+	waitName := key
+	if fieldsReadyName != "" {
+		waitName = fieldsReadyName
+	}
+	return m.waitRebuilt(ctx, target, key, lockName, waitName)
+}
+
+// executeRefreshWithLock 在已拿到分布式锁后执行完整刷新流程。
+func (m *Manager) executeRefreshWithLock(ctx context.Context, refreshCtx context.Context, target Target, key string, fields []string, options refreshOptions, lockKey string, lockValue string, fieldsReadyName string) error {
+	baseRebuildCtx, cancel := m.buildRebuildContext(refreshCtx, target, options.contextPolicy)
+	defer cancel()
+	rebuildCtx, cancelCause := context.WithCancelCause(baseRebuildCtx)
+	defer cancelCause(nil)
+	stopRenew := m.startLockRenew(rebuildCtx, lockKey, lockValue, cancelCause)
+	defer m.releaseRefreshLock(ctx, lockKey, lockValue, stopRenew)
+	prefixEpoch, entries, wroteHiddenEmptyMarker, err := m.loadRefreshEntries(ctx, rebuildCtx, target, key, fields, options)
+	if err != nil {
+		return errors.Tag(err)
+	}
+	if err := m.writeRefreshEntries(ctx, rebuildCtx, target, key, prefixEpoch, entries); err != nil {
+		return errors.Tag(err)
+	}
+	if err := m.finalizeRefreshState(ctx, rebuildCtx, target, key, prefixEpoch, entries, wroteHiddenEmptyMarker, options, fieldsReadyName); err != nil {
+		return errors.Tag(err)
+	}
 	return nil
 }
 
-// waitRebuilt 等待其它实例完成缓存重建。
-func (m *Manager) waitRebuilt(ctx context.Context, target Target, key string, lockName string) (waitRebuildOutcome, error) {
-	waitStep, waitTimes := m.waitPolicy(target)
-	for i := 0; i < waitTimes; i++ {
-		timer := time.NewTimer(waitStep)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return 0, ctx.Err()
-		case <-timer.C:
+// releaseRefreshLock 停止锁续期并在后台安全释放当前实例持有的刷新锁。
+func (m *Manager) releaseRefreshLock(ctx context.Context, lockKey string, lockValue string, stopRenew func()) {
+	stopRenew()
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+	defer cancel()
+	_, _ = m.store.ReleaseLock(releaseCtx, lockKey, lockValue)
+}
+
+// loadRefreshEntries 执行回源、空值占位决策与前缀刷新前置清理。
+func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Context, target Target, key string, fields []string, options refreshOptions) (string, []Entry, bool, error) {
+	prefixEpoch, err := m.preparePrefixRefreshEpoch(rebuildCtx, target, key)
+	if err != nil {
+		return "", nil, false, errors.Tag(err)
+	}
+	params := m.loadParams(target, key, fields)
+	wroteHiddenEmptyMarker := false
+	entries, err := target.Loader(rebuildCtx, params)
+	if err != nil {
+		if cause := context.Cause(rebuildCtx); cause != nil {
+			return "", nil, false, cause
 		}
+		if !errors.Is(err, ErrNotFound) {
+			m.recordLoaderError(ctx, target.Index, err)
+			return "", nil, false, errors.Tag(err)
+		}
+		entries = nil
+	}
+	if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
+		return "", nil, false, errors.Tag(err)
+	}
+	if len(entries) == 0 && target.AllowEmptyMarker && options.requested {
+		if target.VisibleEmptyMark {
+			entries = []Entry{m.emptyEntry(target, key)}
+		} else {
+			if err := m.writeHiddenEmptyMarker(rebuildCtx, target, key); err != nil {
+				return "", nil, false, errors.Tag(err)
+			}
+			wroteHiddenEmptyMarker = true
+			m.recordEmptyMarkerWrite(ctx, target.Index)
+		}
+	}
+	if strings.HasSuffix(target.Key, ":") && key == target.Key {
+		// 前缀目标做全量刷新时先清理旧 key，避免删除源数据中已不存在的脏缓存。
+		if err := m.DeleteByPrefix(rebuildCtx, target.Key); err != nil {
+			return "", nil, false, errors.Tag(err)
+		}
+	}
+	if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
+		return "", nil, false, errors.Tag(err)
+	}
+	return prefixEpoch, entries, wroteHiddenEmptyMarker, nil
+}
+
+// writeRefreshEntries 为当前刷新结果补齐默认配置并执行批量写回。
+func (m *Manager) writeRefreshEntries(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry) error {
+	for index, entry := range entries {
+		entries[index] = m.withTargetDefaults(target, entry)
+	}
+	if len(entries) == 0 {
+		return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
+	}
+	emptyKeys := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(entry.Key) == "" {
+			continue
+		}
+		emptyKeys = append(emptyKeys, m.emptyKey(entry.Key))
+	}
+	if len(emptyKeys) > 0 {
+		if err := m.store.Delete(rebuildCtx, emptyKeys...); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	if err := m.store.WriteBatch(rebuildCtx, entries); err != nil {
+		return errors.Tag(err)
+	}
+	m.recordRefreshEntryCount(ctx, target.Index, len(entries))
+	return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
+}
+
+// finalizeRefreshState 处理空结果收尾、结果元信息写入和补充指标记录。
+func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry, wroteHiddenEmptyMarker bool, options refreshOptions, fieldsReadyName string) error {
+	if len(entries) == 0 && wroteHiddenEmptyMarker {
+		if err := m.deleteBusinessKey(rebuildCtx, target, key); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	if len(entries) == 0 && !wroteHiddenEmptyMarker && (!target.AllowEmptyMarker || !options.requested || !target.VisibleEmptyMark) {
+		if err := m.deleteRefreshedKey(rebuildCtx, target, key); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
+		return errors.Tag(err)
+	}
+	m.markRefreshResults(ctx, key, fieldsReadyName)
+	if len(entries) == 1 && target.AllowEmptyMarker && options.requested && target.VisibleEmptyMark {
+		m.recordEmptyMarkerWrite(ctx, target.Index)
+	}
+	if len(entries) == 0 {
+		m.recordRefreshEntryCount(ctx, target.Index, 0)
+	}
+	return nil
+}
+
+// markRefreshResults 写入 key 级与 fields 级重建完成元信息，供等待方快速判定完成。
+func (m *Manager) markRefreshResults(ctx context.Context, key string, fieldsReadyName string) {
+	m.markRefreshResult(ctx, key)
+	if fieldsReadyName != "" {
+		// fields 场景额外写入 fields 专属 result marker，避免等待方因只看 key 存在而误判完成。
+		m.markRefreshResult(ctx, fieldsReadyName)
+	}
+}
+
+// markRefreshResult 封装一次短超时的重建结果元信息写入，并统一处理日志。
+func (m *Manager) markRefreshResult(ctx context.Context, key string) {
+	resultCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+	defer cancel()
+	if err := m.markRebuildResult(resultCtx, key); err != nil && m.logger != nil {
+		m.logger.Warnf("tablecache写入重建结果元信息失败 key=%s err=%v", key, err)
+	}
+}
+
+// existsMulti 尝试合并多 key exists 检查，降低等待轮询阶段的网络往返；若 Store 未实现则回退为逐个 Exists。
+func (m *Manager) existsMulti(ctx context.Context, keys ...string) (map[string]bool, error) {
+	if store, ok := m.store.(ExistsMultiStore); ok {
+		return store.ExistsMulti(ctx, keys...)
+	}
+	result := make(map[string]bool, len(keys))
+	for _, key := range keys {
 		exists, err := m.store.Exists(ctx, key)
 		if err != nil {
-			return 0, err
+			return nil, errors.Tag(err)
 		}
-		if exists {
+		result[key] = exists
+	}
+	return result, nil
+}
+
+// waitRebuilt 等待其它实例完成缓存重建。
+func (m *Manager) waitRebuilt(ctx context.Context, target Target, key string, lockName string, waitName string) (waitRebuildOutcome, error) {
+	_, waitTimes := m.waitPolicy(target)
+	emptyKey := m.emptyKey(key)
+	resultKey := m.rebuildResultKey(waitName)
+	baseResultKey := m.rebuildResultKey(key)
+	lockKey := m.lockKey(lockName)
+	fieldsRefresh := waitName != key
+	for i := 0; i < waitTimes; i++ {
+		if err := waitWithContext(ctx, m.waitDelay(target, i)); err != nil {
+			return 0, errors.Tag(err)
+		}
+		existsKeys := []string{emptyKey, resultKey, lockKey}
+		// fieldsRefresh 表示本次等待属于 fields 级刷新；此时不依赖业务 key 是否存在来判定完成，
+		// 而是依赖 result marker 或 empty marker，避免“局部刷新”场景误判就绪。
+		if !fieldsRefresh {
+			existsKeys = append([]string{key}, existsKeys...)
+		} else {
+			existsKeys = append(existsKeys, baseResultKey)
+		}
+		existsMap, err := m.existsMulti(ctx, existsKeys...)
+		if err != nil {
+			return 0, errors.Tag(err)
+		}
+		// fieldsRefresh 场景除 fields 专属 result 以外，也接受 baseResultKey，
+		// 用于兼容“已有其它实例完成过完整重建”的情形，避免不必要的重复回源。
+		if (!fieldsRefresh && existsMap[key]) || existsMap[emptyKey] || existsMap[resultKey] || (fieldsRefresh && existsMap[baseResultKey]) {
 			return waitRebuildReady, nil
 		}
-		exists, err = m.store.Exists(ctx, m.emptyKey(key))
-		if err != nil {
-			return 0, err
-		}
-		if exists {
-			return waitRebuildReady, nil
-		}
-		exists, err = m.store.Exists(ctx, m.rebuildResultKey(key))
-		if err != nil {
-			return 0, err
-		}
-		if exists {
-			return waitRebuildReady, nil
-		}
-		exists, err = m.store.Exists(ctx, m.lockKey(lockName))
-		if err != nil {
-			return 0, err
-		}
-		if !exists {
+		if !existsMap[lockKey] {
+			existsKeys := []string{emptyKey, resultKey}
+			if !fieldsRefresh {
+				existsKeys = append([]string{key}, existsKeys...)
+			} else {
+				existsKeys = append(existsKeys, baseResultKey)
+			}
+			existsMap, err := m.existsMulti(ctx, existsKeys...)
+			if err != nil {
+				return 0, errors.Tag(err)
+			}
+			if (!fieldsRefresh && existsMap[key]) || existsMap[emptyKey] || existsMap[resultKey] || (fieldsRefresh && existsMap[baseResultKey]) {
+				return waitRebuildReady, nil
+			}
 			return waitRebuildRetry, nil
 		}
 	}
@@ -781,25 +912,15 @@ func (m *Manager) resolve(key string, fields []string) (Target, LoadParams, erro
 	if key == "" {
 		return Target{}, LoadParams{}, ErrTargetNotFound
 	}
-	for _, target := range m.ordered {
-		if !strings.HasSuffix(target.Key, ":") && key == target.Key {
+	if target, ok := m.fixedKeys[key]; ok {
+		params := m.loadParams(target, key, fields)
+		return target, params, nil
+	}
+	for _, target := range m.prefixTargets {
+		if strings.HasPrefix(key, target.Key) {
 			params := m.loadParams(target, key, fields)
 			return target, params, nil
 		}
-	}
-	var matched Target
-	matchedLen := -1
-	for _, target := range m.ordered {
-		if strings.HasSuffix(target.Key, ":") && strings.HasPrefix(key, target.Key) {
-			if len(target.Key) > matchedLen {
-				matched = target
-				matchedLen = len(target.Key)
-			}
-		}
-	}
-	if matchedLen >= 0 {
-		params := m.loadParams(matched, key, fields)
-		return matched, params, nil
 	}
 	return Target{}, LoadParams{}, errors.Wrapf(ErrTargetNotFound, "缓存key[%s]未配置", key)
 }
@@ -820,6 +941,18 @@ func (m *Manager) loadParams(target Target, key string, fields []string) LoadPar
 			cleanFields = append(cleanFields, field)
 		}
 	}
+	if len(cleanFields) > 0 {
+		// fields 做排序去重，确保同一组 fields 形成稳定签名，便于 singleflight 合并与等待判定。
+		sort.Strings(cleanFields)
+		write := 0
+		for read := 0; read < len(cleanFields); read++ {
+			if read == 0 || cleanFields[read] != cleanFields[read-1] {
+				cleanFields[write] = cleanFields[read]
+				write++
+			}
+		}
+		cleanFields = cleanFields[:write]
+	}
 	return LoadParams{
 		Target:   target,
 		Key:      key,
@@ -827,6 +960,52 @@ func (m *Manager) loadParams(target Target, key string, fields []string) LoadPar
 		KeyParts: parts,
 		Fields:   cleanFields,
 	}
+}
+
+// refreshReadyName 返回本次刷新用于“就绪判定”的标识名。
+// 当 fields 为空时使用原始 key；否则把 fields 拼接到 key 上，并在过长时对 fields 做 hash 收敛，避免生成超长 Redis key。
+func (m *Manager) refreshReadyName(key string, fields []string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "unknown"
+	}
+	if len(fields) == 0 {
+		return key
+	}
+	totalLen := len(fields) - 1
+	for _, field := range fields {
+		totalLen += len(field)
+	}
+	const prefix = "|fields="
+	if totalLen <= 64 {
+		var builder strings.Builder
+		builder.Grow(len(key) + len(prefix) + totalLen)
+		builder.WriteString(key)
+		builder.WriteString(prefix)
+		for index, field := range fields {
+			if index > 0 {
+				builder.WriteByte(',')
+			}
+			builder.WriteString(field)
+		}
+		return builder.String()
+	}
+	hasher := sha1.New()
+	for index, field := range fields {
+		if index > 0 {
+			_, _ = io.WriteString(hasher, ",")
+		}
+		_, _ = io.WriteString(hasher, field)
+	}
+	sum := hasher.Sum(nil)
+	var encoded [sha1.Size * 2]byte
+	hex.Encode(encoded[:], sum)
+	var builder strings.Builder
+	builder.Grow(len(key) + len(prefix) + len(encoded))
+	builder.WriteString(key)
+	builder.WriteString(prefix)
+	builder.Write(encoded[:])
+	return builder.String()
 }
 
 // emptyEntry 构造空值占位缓存。
@@ -837,7 +1016,7 @@ func (m *Manager) emptyEntry(target Target, key string) Entry {
 	}
 	switch target.Type {
 	case TypeHash:
-		return Entry{Key: key, Type: TypeHash, Value: map[string]any{"value": m.emptyMarker}, TTL: ttl}
+		return Entry{Key: key, Type: TypeHash, Value: map[string]any{hashEmptyMarkerField: m.emptyMarker}, TTL: ttl}
 	case TypeList:
 		return Entry{Key: key, Type: TypeList, Value: []any{m.emptyMarker}, TTL: ttl}
 	case TypeSet:
@@ -854,7 +1033,7 @@ func (m *Manager) isEmptyValue(typ CacheType, value any) bool {
 	switch typ {
 	case TypeHash:
 		if data, ok := value.(map[string]string); ok {
-			return data["value"] == m.emptyMarker
+			return data[hashEmptyMarkerField] == m.emptyMarker || data["value"] == m.emptyMarker
 		}
 	case TypeList, TypeSet:
 		if data, ok := value.([]string); ok {
@@ -890,7 +1069,7 @@ func (m *Manager) decodeValue(value any, dest any) error {
 	}
 	body, err := json.Marshal(value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	return m.decoder(body, dest)
 }
@@ -913,7 +1092,7 @@ func (m *Manager) lookup(ctx context.Context, target Target, params LoadParams, 
 			m.recordLookupState(ctx, target.Index, LookupStateMiss)
 			return LookupResult{State: LookupStateMiss}, nil
 		}
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	if m.isEmptyValue(target.Type, value) {
 		m.recordCacheMiss(ctx, target.Index)
@@ -921,7 +1100,7 @@ func (m *Manager) lookup(ctx context.Context, target Target, params LoadParams, 
 		return LookupResult{State: LookupStateEmpty}, nil
 	}
 	if err := m.decodeValue(value, dest); err != nil {
-		return LookupResult{}, err
+		return LookupResult{}, errors.Tag(err)
 	}
 	m.recordCacheHit(ctx, target.Index)
 	m.recordLookupState(ctx, target.Index, LookupStateHit)
@@ -1001,7 +1180,7 @@ func (m *Manager) preparePrefixRefreshEpoch(ctx context.Context, target Target, 
 	if key == target.Key {
 		epoch := newLockValue()
 		if err := m.writePrefixRefreshEpoch(ctx, target, epoch); err != nil {
-			return "", err
+			return "", errors.Tag(err)
 		}
 		return epoch, nil
 	}
@@ -1012,7 +1191,7 @@ func (m *Manager) preparePrefixRefreshEpoch(ctx context.Context, target Target, 
 // 若检测到同前缀全量刷新仍在执行，或前缀代际已变化，则返回重试信号，避免旧单 key 结果覆盖新全量结果。
 func (m *Manager) ensureRefreshWritable(ctx context.Context, target Target, key string, prefixEpoch string) error {
 	if err := context.Cause(ctx); err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	prefixLockKey, ok := m.prefixRefreshLockKey(target, key)
 	if !ok {
@@ -1020,14 +1199,14 @@ func (m *Manager) ensureRefreshWritable(ctx context.Context, target Target, key 
 	}
 	exists, err := m.store.Exists(ctx, prefixLockKey)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if exists {
 		return errPrefixRefreshBusy
 	}
 	currentEpoch, err := m.readPrefixRefreshEpoch(ctx, target)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if currentEpoch != prefixEpoch {
 		return errPrefixRefreshBusy
@@ -1041,12 +1220,12 @@ func (m *Manager) waitPrefixRefreshIdle(ctx context.Context, target Target, key 
 	if !ok {
 		return nil
 	}
-	waitStep, waitTimes := m.waitPolicy(target)
+	_, waitTimes := m.waitPolicy(target)
 	waited := false
 	for i := 0; i < waitTimes; i++ {
 		exists, err := m.store.Exists(ctx, prefixLockKey)
 		if err != nil {
-			return err
+			return errors.Tag(err)
 		}
 		if !exists {
 			return nil
@@ -1056,12 +1235,8 @@ func (m *Manager) waitPrefixRefreshIdle(ctx context.Context, target Target, key 
 			m.recordPrefixWait(ctx, target.Index)
 			m.logInfoEvent("prefix_wait", target.Index, key, "prefix", target.Key)
 		}
-		timer := time.NewTimer(waitStep)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
+		if err := waitWithContext(ctx, m.waitDelay(target, i)); err != nil {
+			return errors.Tag(err)
 		}
 	}
 	m.recordWaitTimeout(ctx, target.Index)
@@ -1095,7 +1270,7 @@ func (m *Manager) readPrefixRefreshEpoch(ctx context.Context, target Target) (st
 		if errors.Is(err, ErrCacheMiss) {
 			return "", nil
 		}
-		return "", err
+		return "", errors.Tag(err)
 	}
 	text, ok := value.(string)
 	if !ok {
@@ -1109,10 +1284,12 @@ func (m *Manager) writePrefixRefreshEpoch(ctx context.Context, target Target, ep
 	if !strings.HasSuffix(target.Key, ":") {
 		return nil
 	}
+	ttl := m.prefixEpochTTL
 	return m.store.Write(ctx, Entry{
 		Key:   m.prefixEpochKey(target.Key),
 		Type:  TypeString,
 		Value: epoch,
+		TTL:   ttl,
 	})
 }
 
@@ -1392,6 +1569,21 @@ func (m *Manager) registerTarget(target Target) error {
 	}
 	m.targets[target.Index] = target
 	m.ordered = append(m.ordered, target)
+	if strings.HasSuffix(target.Key, ":") {
+		m.prefixTargetsM[target.Key] = target
+		insertAt := len(m.prefixTargets)
+		for index, item := range m.prefixTargets {
+			if len(target.Key) > len(item.Key) {
+				insertAt = index
+				break
+			}
+		}
+		m.prefixTargets = append(m.prefixTargets, Target{})
+		copy(m.prefixTargets[insertAt+1:], m.prefixTargets[insertAt:])
+		m.prefixTargets[insertAt] = target
+		return nil
+	}
+	m.fixedKeys[target.Key] = target
 	return nil
 }
 
@@ -1401,10 +1593,8 @@ func (m *Manager) resolvePrefixTarget(prefix string) (Target, error) {
 	if prefix == "" {
 		return Target{}, ErrTargetNotFound
 	}
-	for _, target := range m.ordered {
-		if strings.HasSuffix(target.Key, ":") && target.Key == prefix {
-			return target, nil
-		}
+	if target, ok := m.prefixTargetsM[prefix]; ok {
+		return target, nil
 	}
 	return Target{}, errors.Wrapf(ErrTargetNotFound, "缓存前缀[%s]未注册", prefix)
 }
@@ -1451,6 +1641,29 @@ func (m *Manager) waitPolicy(target Target) (time.Duration, int) {
 	return step, times
 }
 
+// waitDelay 返回第 N 次等待的实际休眠时长。
+// 显式配置 WithWait 时保持固定步长；默认策略则使用逐步退避，降低热点场景下对 Redis 的轮询压力。
+func (m *Manager) waitDelay(target Target, attempt int) time.Duration {
+	step, _ := m.waitPolicy(target)
+	if step <= 0 {
+		step = defaultWaitStepMin
+	}
+	if m.waitConfigured {
+		return step
+	}
+	delay := step
+	for i := 0; i < attempt; i++ {
+		if delay >= defaultWaitStepMax {
+			return defaultWaitStepMax
+		}
+		delay *= 2
+		if delay >= defaultWaitStepMax {
+			return defaultWaitStepMax
+		}
+	}
+	return delay
+}
+
 // defaultWaitTimeout 返回默认等待其它实例完成刷新的总时长。
 func (m *Manager) defaultWaitTimeout(target Target) time.Duration {
 	total := m.lockTTL
@@ -1465,6 +1678,26 @@ func (m *Manager) defaultWaitTimeout(target Target) time.Duration {
 		total = time.Second
 	}
 	return total
+}
+
+// waitWithContext 在支持取消的前提下等待指定时长，避免在多处重复编写 Timer 模板代码。
+func waitWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // effectiveRebuildContextPolicy 返回本次执行实际生效的上下文取消策略。

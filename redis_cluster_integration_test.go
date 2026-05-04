@@ -21,6 +21,11 @@ type clusterIntegrationConfig struct {
 	PoolSize int               // PoolSize 是连接池大小
 }
 
+// clusterSlotsCompatTestClient 表示测试里兼容读取旧版 ClusterSlots 的最小客户端能力。
+type clusterSlotsCompatTestClient interface {
+	ClusterSlots(ctx context.Context) *redis.ClusterSlotsCmd
+}
+
 // TestRedisClusterIntegration 验证真实 Redis Cluster 环境下的关键缓存能力。
 func TestRedisClusterIntegration(t *testing.T) {
 	config, ok := loadClusterIntegrationConfig()
@@ -46,12 +51,12 @@ func TestRedisClusterIntegration(t *testing.T) {
 		if err := client.Ping(ctx).Err(); err != nil {
 			t.Fatalf("cluster ping error = %v", err)
 		}
-		slots, err := client.ClusterSlots(ctx).Result()
+		slots, err := loadRewrittenClusterSlots(ctx, config)
 		if err != nil {
-			t.Fatalf("ClusterSlots() error = %v", err)
+			t.Fatalf("loadRewrittenClusterSlots() error = %v", err)
 		}
 		if len(slots) == 0 {
-			t.Fatalf("ClusterSlots() len = 0, want > 0")
+			t.Fatalf("loadRewrittenClusterSlots() len = 0, want > 0")
 		}
 	})
 
@@ -168,12 +173,13 @@ func newClusterIntegrationClient(ctx context.Context, config clusterIntegrationC
 	})
 	if err := client.Ping(ctx).Err(); err != nil {
 		_ = client.Close()
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	return client, nil
 }
 
 // loadRewrittenClusterSlots 从可访问的种子节点读取槽位信息，并按 addr_map 改写容器 hostname。
+// Redis 7 及以上优先使用 ClusterShards；旧版本不支持时自动回退到 ClusterSlots。
 func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationConfig) ([]redis.ClusterSlot, error) {
 	var lastErr error
 	for _, addr := range config.Addrs {
@@ -181,16 +187,11 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 			Addr:     addr,
 			Password: config.Password,
 		})
-		slots, err := seedClient.ClusterSlots(ctx).Result()
+		slots, err := loadClusterSlotsCompatForTest(ctx, seedClient, config.AddrMap)
 		_ = seedClient.Close()
 		if err != nil {
 			lastErr = err
 			continue
-		}
-		for slotIndex, slot := range slots {
-			for nodeIndex, node := range slot.Nodes {
-				slots[slotIndex].Nodes[nodeIndex].Addr = rewriteClusterAddr(node.Addr, config.AddrMap)
-			}
 		}
 		return slots, nil
 	}
@@ -198,6 +199,91 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 		lastErr = fmt.Errorf("没有可用的 Redis Cluster 种子节点")
 	}
 	return nil, lastErr
+}
+
+// loadClusterSlotsCompatForTest 优先使用 ClusterShards；若目标 Redis 版本不支持，则自动回退到 ClusterSlots。
+func loadClusterSlotsCompatForTest(ctx context.Context, seedClient *redis.Client, addrMap map[string]string) ([]redis.ClusterSlot, error) {
+	shards, err := seedClient.ClusterShards(ctx).Result()
+	if err == nil {
+		return clusterShardsToSlotsForTest(shards, addrMap), nil
+	}
+	if !isClusterShardsUnsupportedForTest(err) {
+		return nil, errors.Tag(err)
+	}
+	slots, err := loadLegacyClusterSlotsForTest(ctx, seedClient)
+	if err != nil {
+		return nil, err
+	}
+	for slotIndex, slot := range slots {
+		for nodeIndex, node := range slot.Nodes {
+			slots[slotIndex].Nodes[nodeIndex].Addr = rewriteClusterAddr(node.Addr, addrMap)
+		}
+	}
+	return slots, nil
+}
+
+// loadLegacyClusterSlotsForTest 通过旧版 ClusterSlots 命令读取槽位信息，作为 Redis 7 以下版本的兼容回退。
+func loadLegacyClusterSlotsForTest(ctx context.Context, client clusterSlotsCompatTestClient) ([]redis.ClusterSlot, error) {
+	slots, err := client.ClusterSlots(ctx).Result()
+	return slots, errors.Tag(err)
+}
+
+// clusterShardsToSlotsForTest 把 Redis 7 的 ClusterShards 结果转换成 ClusterSlots 回调需要的结构。
+func clusterShardsToSlotsForTest(shards []redis.ClusterShard, addrMap map[string]string) []redis.ClusterSlot {
+	slots := make([]redis.ClusterSlot, 0, len(shards))
+	for _, shard := range shards {
+		nodes := make([]redis.ClusterNode, 0, len(shard.Nodes))
+		for _, node := range shard.Nodes {
+			addr := rewriteClusterAddr(clusterShardNodeAddrForTest(node), addrMap)
+			if strings.TrimSpace(addr) == "" {
+				continue
+			}
+			nodes = append(nodes, redis.ClusterNode{
+				ID:   node.ID,
+				Addr: addr,
+			})
+		}
+		for _, slotRange := range shard.Slots {
+			slots = append(slots, redis.ClusterSlot{
+				Start: int(slotRange.Start),
+				End:   int(slotRange.End),
+				Nodes: nodes,
+			})
+		}
+	}
+	return slots
+}
+
+// clusterShardNodeAddrForTest 返回 ClusterShards 节点的可连接地址。
+func clusterShardNodeAddrForTest(node redis.Node) string {
+	endpoint := strings.TrimSpace(node.Endpoint)
+	if endpoint != "" {
+		return endpoint
+	}
+	host := strings.TrimSpace(node.Hostname)
+	if host == "" {
+		host = strings.TrimSpace(node.IP)
+	}
+	if host == "" {
+		return ""
+	}
+	port := node.Port
+	if port <= 0 {
+		port = node.TLSPort
+	}
+	if port <= 0 {
+		return host
+	}
+	return net.JoinHostPort(host, fmt.Sprintf("%d", port))
+}
+
+// isClusterShardsUnsupportedForTest 判断当前错误是否表示 Redis 服务端不支持 ClusterShards。
+func isClusterShardsUnsupportedForTest(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unknown command") && strings.Contains(message, "cluster") && strings.Contains(message, "shards")
 }
 
 // rewriteClusterAddr 按 addr_map 把集群返回的 hostname 改写为宿主机可访问地址。

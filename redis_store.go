@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -34,15 +35,63 @@ type RedisStoreOption func(*RedisStore)
 
 // RedisStore 是基于 go-redis 的 Store 适配器，可直接服务 go-zero、Gin、Kratos 等 Go 框架。
 type RedisStore struct {
-	client  redis.UniversalClient // client 是 Redis 通用客户端，兼容单机、哨兵和集群
-	encoder Encoder               // encoder 是复杂值序列化函数
+	client          redis.UniversalClient // client 是 Redis 通用客户端，兼容单机、哨兵和集群
+	encoder         Encoder               // encoder 是复杂值序列化函数
+	pipelineRetries int                   // pipelineRetries 表示批量 UNLINK/覆盖写在瞬时失败时的最大重试次数
+}
+
+// PipelineExecError 表示 Pipeline 执行失败的增强错误信息。
+// 在部分命令失败（例如 cluster 路由抖动、网络短暂错误）时可携带失败 key 列表，便于线上快速定位与重试。
+type PipelineExecError struct {
+	Operation  string   // Operation 表示本次 Pipeline 执行的操作名称（用于日志与排障归类）
+	FailedKeys []string // FailedKeys 表示本次 Pipeline 中检测到失败的 key 列表（已排序去重）
+	Cause      error    // Cause 是底层错误原因
+}
+
+func (e *PipelineExecError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if len(e.FailedKeys) == 0 {
+		return fmt.Sprintf("tablecache pipeline exec failed op=%s", e.Operation)
+	}
+	return fmt.Sprintf("tablecache pipeline exec failed op=%s failed_keys=%d", e.Operation, len(e.FailedKeys))
+}
+
+func (e *PipelineExecError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Cause
+}
+
+type pipelineCmd struct {
+	key string      // key 表示当前命令关联的业务 key，用于错误聚合时定位失败项
+	cmd redis.Cmder // cmd 表示当前 pipeline 中的具体命令实例
+}
+
+// uniqueSortedKeys 对失败 key 做排序去重，便于日志与监控稳定展示。
+func uniqueSortedKeys(keys []string) []string {
+	if len(keys) == 0 {
+		return nil
+	}
+	sort.Strings(keys)
+	write := 0
+	for read := 0; read < len(keys); read++ {
+		if read == 0 || keys[read] != keys[read-1] {
+			keys[write] = keys[read]
+			write++
+		}
+	}
+	return keys[:write]
 }
 
 // NewRedisStore 创建 go-redis 存储适配器。
 func NewRedisStore(client redis.UniversalClient, opts ...RedisStoreOption) *RedisStore {
 	store := &RedisStore{
-		client:  client,
-		encoder: defaultEncoder,
+		client:          client,
+		encoder:         defaultEncoder,
+		pipelineRetries: 1,
 	}
 	for _, opt := range opts {
 		opt(store)
@@ -55,6 +104,15 @@ func WithRedisEncoder(encoder Encoder) RedisStoreOption {
 	return func(store *RedisStore) {
 		if encoder != nil {
 			store.encoder = encoder
+		}
+	}
+}
+
+// WithPipelineRetries 设置批量删除与覆盖写的瞬时失败重试次数。
+func WithPipelineRetries(retries int) RedisStoreOption {
+	return func(store *RedisStore) {
+		if retries >= 0 {
+			store.pipelineRetries = retries
 		}
 	}
 }
@@ -94,12 +152,12 @@ func (s *RedisStore) DeletePattern(ctx context.Context, pattern string, count in
 		err := clusterClient.ForEachMaster(ctx, func(masterCtx context.Context, master *redis.Client) error {
 			count, err := s.scanDeletePattern(masterCtx, master, pattern, count)
 			if err != nil {
-				return err
+				return errors.Tag(err)
 			}
 			deletedCount.Add(count)
 			return nil
 		})
-		return deletedCount.Load(), err
+		return deletedCount.Load(), errors.Tag(err)
 	}
 	return s.scanDeletePattern(ctx, s.client, pattern, count)
 }
@@ -111,11 +169,11 @@ func (s *RedisStore) scanDeletePattern(ctx context.Context, client redis.Univers
 	for {
 		keys, next, err := client.Scan(ctx, cursor, pattern, count).Result()
 		if err != nil {
-			return deletedCount, err
+			return deletedCount, errors.Tag(err)
 		}
 		if len(keys) > 0 {
 			if err := s.unlinkKeys(ctx, client, keys); err != nil {
-				return deletedCount, err
+				return deletedCount, errors.Tag(err)
 			}
 			deletedCount += int64(len(keys))
 		}
@@ -129,12 +187,47 @@ func (s *RedisStore) scanDeletePattern(ctx context.Context, client redis.Univers
 
 // unlinkKeys 使用 Pipeline 单 key UNLINK，兼容 Redis Cluster 跨 slot 删除。
 func (s *RedisStore) unlinkKeys(ctx context.Context, client redis.UniversalClient, keys []string) error {
-	pipe := client.Pipeline()
-	for _, key := range keys {
-		pipe.Unlink(ctx, key)
+	const chunkSize = 512
+	for start := 0; start < len(keys); start += chunkSize {
+		end := start + chunkSize
+		if end > len(keys) {
+			end = len(keys)
+		}
+		var finalCmds []pipelineCmd
+		// 即使 Exec 返回 nil，也要检查各命令的 Err，避免漏掉部分失败（集群/网络抖动下更常见）。
+		err := execPipelineWithRetry(ctx, s.pipelineRetries, func() error {
+			pipe := client.Pipeline()
+			cmds := make([]pipelineCmd, 0, end-start)
+			for _, key := range keys[start:end] {
+				cmds = append(cmds, pipelineCmd{key: key, cmd: pipe.Unlink(ctx, key)})
+			}
+			finalCmds = cmds
+			_, execErr := pipe.Exec(ctx)
+			if execErr == nil {
+				for _, cmd := range cmds {
+					if cmd.cmd.Err() != nil {
+						execErr = cmd.cmd.Err()
+						break
+					}
+				}
+			}
+			return execErr
+		})
+		if err != nil {
+			failed := make([]string, 0, 8)
+			for _, cmd := range finalCmds {
+				if cmd.cmd.Err() != nil {
+					failed = append(failed, cmd.key)
+				}
+			}
+			return errors.Tag(&PipelineExecError{
+				Operation:  "unlink_keys",
+				FailedKeys: uniqueSortedKeys(failed),
+				Cause:      err,
+			})
+		}
 	}
-	_, err := pipe.Exec(ctx)
-	return err
+	return nil
 }
 
 // Exists 判断 Redis key 是否存在。
@@ -147,7 +240,42 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 		return false, nil
 	}
 	count, err := s.client.Exists(ctx, key).Result()
-	return count > 0, err
+	return count > 0, errors.Tag(err)
+}
+
+func (s *RedisStore) ExistsMulti(ctx context.Context, keys ...string) (map[string]bool, error) {
+	if s == nil || s.client == nil {
+		return map[string]bool{}, nil
+	}
+	cleanKeys := make([]string, 0, len(keys)) // cleanKeys 表示清洗后的有效 key 列表（去空白）
+	for _, key := range keys {
+		key = strings.TrimSpace(key)
+		if key != "" {
+			cleanKeys = append(cleanKeys, key)
+		}
+	}
+	if len(cleanKeys) == 0 {
+		return map[string]bool{}, nil
+	}
+	// Pipeline 合并 Exists，减少高频等待轮询阶段的网络往返。
+	pipe := s.client.Pipeline() // pipe 用于合并多次 Exists，减少网络往返
+	cmds := make([]*redis.IntCmd, 0, len(cleanKeys))
+	for _, key := range cleanKeys {
+		cmds = append(cmds, pipe.Exists(ctx, key))
+	}
+	_, err := pipe.Exec(ctx)
+	if err != nil {
+		return nil, errors.Tag(err)
+	}
+	result := make(map[string]bool, len(cleanKeys))
+	for index, cmd := range cmds {
+		count, cmdErr := cmd.Result()
+		if cmdErr != nil {
+			return nil, errors.Tag(cmdErr)
+		}
+		result[cleanKeys[index]] = count > 0
+	}
+	return result, nil
 }
 
 // Read 按缓存类型读取 Redis 原始值。
@@ -199,7 +327,7 @@ func (s *RedisStore) RefreshLock(ctx context.Context, key string, value string, 
 	}
 	result, err := refreshLockScript.Run(ctx, s.client, []string{key}, value, ttl.Milliseconds()).Int64()
 	if err != nil {
-		return false, err
+		return false, errors.Tag(err)
 	}
 	return result > 0, nil
 }
@@ -216,7 +344,7 @@ func (s *RedisStore) ReleaseLock(ctx context.Context, key string, value string) 
 	}
 	result, err := releaseLockScript.Run(ctx, s.client, []string{key}, value).Int64()
 	if err != nil {
-		return false, err
+		return false, errors.Tag(err)
 	}
 	return result > 0, nil
 }
@@ -237,18 +365,103 @@ func (s *RedisStore) WriteBatch(ctx context.Context, entries []Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	pipe := s.client.Pipeline()
-	for _, entry := range entries {
-		if err := s.enqueueWrite(ctx, pipe, entry); err != nil {
-			return err
+	retryable := entriesRetryable(entries)
+	// 分批提交避免单个 pipeline 过大导致的网络包过大、内存尖刺与 Redis 侧处理压力。
+	const chunkSize = 256
+	for start := 0; start < len(entries); start += chunkSize {
+		end := start + chunkSize
+		if end > len(entries) {
+			end = len(entries)
+		}
+		var finalCmds []pipelineCmd
+		// 即使 Exec 返回 nil，也要检查各命令的 Err，避免漏掉部分失败。
+		retries := 0
+		if retryable {
+			retries = s.pipelineRetries
+		}
+		err := execPipelineWithRetry(ctx, retries, func() error {
+			pipe := s.client.Pipeline()
+			cmds := make([]pipelineCmd, 0, (end-start)*3)
+			for _, entry := range entries[start:end] {
+				if err := s.enqueueWrite(ctx, pipe, entry, &cmds); err != nil {
+					return errors.Tag(err)
+				}
+			}
+			finalCmds = cmds
+			_, execErr := pipe.Exec(ctx)
+			if execErr == nil {
+				for _, cmd := range cmds {
+					if cmd.cmd.Err() != nil {
+						execErr = cmd.cmd.Err()
+						break
+					}
+				}
+			}
+			return execErr
+		})
+		if err != nil {
+			failed := make([]string, 0, 16)
+			for _, cmd := range finalCmds {
+				if cmd.cmd.Err() != nil {
+					failed = append(failed, cmd.key)
+				}
+			}
+			return errors.Tag(&PipelineExecError{
+				Operation:  "write_batch",
+				FailedKeys: uniqueSortedKeys(failed),
+				Cause:      err,
+			})
 		}
 	}
-	_, err := pipe.Exec(ctx)
-	return err
+	return nil
+}
+
+// entriesRetryable 判断当前批量写是否允许自动重试。
+// 仅对“默认覆盖写”开放重试，避免 Overwrite=false 的增量写重复执行导致语义放大。
+func entriesRetryable(entries []Entry) bool {
+	for _, entry := range entries {
+		if !entryShouldOverwrite(entry) {
+			return false
+		}
+	}
+	return true
+}
+
+// execPipelineWithRetry 对可安全重试的 pipeline 做轻量重试，吸收瞬时网络/路由抖动。
+func execPipelineWithRetry(ctx context.Context, retries int, exec func() error) error {
+	if retries < 0 {
+		retries = 0
+	}
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		if attempt > 0 {
+			if err := waitWithContext(ctx, pipelineRetryDelay(attempt)); err != nil {
+				return errors.Tag(err)
+			}
+		}
+		if err := exec(); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return errors.Tag(lastErr)
+}
+
+// pipelineRetryDelay 返回 pipeline 第 N 次重试前的退避时长。
+func pipelineRetryDelay(attempt int) time.Duration {
+	delay := 10 * time.Millisecond
+	for i := 1; i < attempt; i++ {
+		delay *= 2
+		if delay >= 80*time.Millisecond {
+			return 80 * time.Millisecond
+		}
+	}
+	return delay
 }
 
 // enqueueWrite 把单条缓存写入命令追加到 Pipeline。
-func (s *RedisStore) enqueueWrite(ctx context.Context, pipe redis.Pipeliner, entry Entry) error {
+func (s *RedisStore) enqueueWrite(ctx context.Context, pipe redis.Pipeliner, entry Entry, cmds *[]pipelineCmd) error {
 	entry.Key = strings.TrimSpace(entry.Key)
 	if entry.Key == "" {
 		return errors.Errorf("Redis缓存key不能为空")
@@ -256,98 +469,111 @@ func (s *RedisStore) enqueueWrite(ctx context.Context, pipe redis.Pipeliner, ent
 	ttl := jitterDuration(entry.TTL, entry.Jitter)
 	switch entry.Type {
 	case TypeString:
-		return s.enqueueString(ctx, pipe, entry, ttl)
+		return s.enqueueString(ctx, pipe, entry, ttl, cmds)
 	case TypeHash:
-		return s.enqueueHash(ctx, pipe, entry, ttl)
+		return s.enqueueHash(ctx, pipe, entry, ttl, cmds)
 	case TypeList:
-		return s.enqueueList(ctx, pipe, entry, ttl)
+		return s.enqueueList(ctx, pipe, entry, ttl, cmds)
 	case TypeSet:
-		return s.enqueueSet(ctx, pipe, entry, ttl)
+		return s.enqueueSet(ctx, pipe, entry, ttl, cmds)
 	case TypeZSet:
-		return s.enqueueZSet(ctx, pipe, entry, ttl)
+		return s.enqueueZSet(ctx, pipe, entry, ttl, cmds)
 	default:
 		return errors.Errorf("不支持的Redis缓存类型: %s", entry.Type)
 	}
 }
 
 // enqueueString 追加 String 缓存写入命令。
-func (s *RedisStore) enqueueString(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration) error {
+func (s *RedisStore) enqueueString(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
 	value, err := s.encodeString(entry.Value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
-	pipe.Set(ctx, entry.Key, value, ttl)
+	cmd := pipe.Set(ctx, entry.Key, value, ttl)
+	*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	return nil
 }
 
 // enqueueHash 追加 Hash 缓存写入命令。
-func (s *RedisStore) enqueueHash(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration) error {
+func (s *RedisStore) enqueueHash(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
 	values, err := s.normalizeMap(entry.Value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if entryShouldOverwrite(entry) {
-		pipe.Unlink(ctx, entry.Key)
+		cmd := pipe.Unlink(ctx, entry.Key)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if len(values) > 0 {
-		pipe.HSet(ctx, entry.Key, values)
+		cmd := pipe.HSet(ctx, entry.Key, values)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if ttl > 0 {
-		pipe.Expire(ctx, entry.Key, ttl)
+		cmd := pipe.Expire(ctx, entry.Key, ttl)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	return nil
 }
 
 // enqueueList 追加 List 缓存写入命令。
-func (s *RedisStore) enqueueList(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration) error {
+func (s *RedisStore) enqueueList(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
 	values, err := s.normalizeSlice(entry.Value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if entryShouldOverwrite(entry) {
-		pipe.Unlink(ctx, entry.Key)
+		cmd := pipe.Unlink(ctx, entry.Key)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if len(values) > 0 {
-		pipe.RPush(ctx, entry.Key, values...)
+		cmd := pipe.RPush(ctx, entry.Key, values...)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if ttl > 0 {
-		pipe.Expire(ctx, entry.Key, ttl)
+		cmd := pipe.Expire(ctx, entry.Key, ttl)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	return nil
 }
 
 // enqueueSet 追加 Set 缓存写入命令。
-func (s *RedisStore) enqueueSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration) error {
+func (s *RedisStore) enqueueSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
 	values, err := s.normalizeSlice(entry.Value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if entryShouldOverwrite(entry) {
-		pipe.Unlink(ctx, entry.Key)
+		cmd := pipe.Unlink(ctx, entry.Key)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if len(values) > 0 {
-		pipe.SAdd(ctx, entry.Key, values...)
+		cmd := pipe.SAdd(ctx, entry.Key, values...)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if ttl > 0 {
-		pipe.Expire(ctx, entry.Key, ttl)
+		cmd := pipe.Expire(ctx, entry.Key, ttl)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	return nil
 }
 
 // enqueueZSet 追加 ZSet 缓存写入命令。
-func (s *RedisStore) enqueueZSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration) error {
+func (s *RedisStore) enqueueZSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
 	values, err := s.normalizeZSet(entry.Value)
 	if err != nil {
-		return err
+		return errors.Tag(err)
 	}
 	if entryShouldOverwrite(entry) {
-		pipe.Unlink(ctx, entry.Key)
+		cmd := pipe.Unlink(ctx, entry.Key)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if len(values) > 0 {
-		pipe.ZAdd(ctx, entry.Key, values...)
+		cmd := pipe.ZAdd(ctx, entry.Key, values...)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	if ttl > 0 {
-		pipe.Expire(ctx, entry.Key, ttl)
+		cmd := pipe.Expire(ctx, entry.Key, ttl)
+		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
 	}
 	return nil
 }
@@ -358,14 +584,14 @@ func (s *RedisStore) readString(ctx context.Context, key string) (string, error)
 	if err == redis.Nil {
 		return "", ErrCacheMiss
 	}
-	return value, err
+	return value, errors.Tag(err)
 }
 
 // readHash 读取 Hash 缓存。
 func (s *RedisStore) readHash(ctx context.Context, key string) (map[string]string, error) {
 	value, err := s.client.HGetAll(ctx, key).Result()
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	if len(value) == 0 {
 		return nil, ErrCacheMiss
@@ -377,7 +603,7 @@ func (s *RedisStore) readHash(ctx context.Context, key string) (map[string]strin
 func (s *RedisStore) readList(ctx context.Context, key string) ([]string, error) {
 	value, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	if len(value) == 0 {
 		return nil, ErrCacheMiss
@@ -389,7 +615,7 @@ func (s *RedisStore) readList(ctx context.Context, key string) ([]string, error)
 func (s *RedisStore) readSet(ctx context.Context, key string) ([]string, error) {
 	value, err := s.client.SMembers(ctx, key).Result()
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	if len(value) == 0 {
 		return nil, ErrCacheMiss
@@ -401,7 +627,7 @@ func (s *RedisStore) readSet(ctx context.Context, key string) ([]string, error) 
 func (s *RedisStore) readZSet(ctx context.Context, key string) ([]ZMember, error) {
 	value, err := s.client.ZRangeWithScores(ctx, key, 0, -1).Result()
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	if len(value) == 0 {
 		return nil, ErrCacheMiss
@@ -451,7 +677,7 @@ func (s *RedisStore) normalizeMap(value any) (map[string]any, error) {
 	for _, mapKey := range refValue.MapKeys() {
 		item, err := s.encodeRedisValue(refValue.MapIndex(mapKey).Interface())
 		if err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		result[fmt.Sprint(mapKey.Interface())] = item
 	}
@@ -464,7 +690,7 @@ func (s *RedisStore) encodeMapValues(value map[string]any) (map[string]any, erro
 	for field, item := range value {
 		encoded, err := s.encodeRedisValue(item)
 		if err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		result[field] = encoded
 	}
@@ -500,7 +726,7 @@ func (s *RedisStore) normalizeSlice(value any) ([]any, error) {
 	for i := 0; i < refValue.Len(); i++ {
 		item, err := s.encodeRedisValue(refValue.Index(i).Interface())
 		if err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		result = append(result, item)
 	}
@@ -513,7 +739,7 @@ func (s *RedisStore) encodeSliceValues(value []any) ([]any, error) {
 	for _, item := range value {
 		encoded, err := s.encodeRedisValue(item)
 		if err != nil {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		result = append(result, encoded)
 	}
@@ -531,7 +757,7 @@ func (s *RedisStore) normalizeZSet(value any) ([]redis.Z, error) {
 		for _, item := range typed {
 			member, err := s.encodeRedisValue(item.Member)
 			if err != nil {
-				return nil, err
+				return nil, errors.Tag(err)
 			}
 			result = append(result, redis.Z{Score: item.Score, Member: member})
 		}
@@ -565,7 +791,7 @@ func (s *RedisStore) encodeRedisValue(value any) (any, error) {
 func defaultEncoder(value any) (string, error) {
 	body, err := json.Marshal(value)
 	if err != nil {
-		return "", err
+		return "", errors.Tag(err)
 	}
 	return string(body), nil
 }
