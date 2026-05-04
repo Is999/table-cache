@@ -13,6 +13,7 @@ import (
 	"time"
 
 	utils "github.com/Is999/go-utils"
+	"github.com/Is999/go-utils/errors"
 	tablecache "github.com/Is999/table-cache"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
@@ -38,6 +39,11 @@ type Config struct {
 	RedisPoolSize              int               // RedisPoolSize 是 Redis 连接池大小
 	RedisTLS                   bool              // RedisTLS 表示是否启用 TLS
 	RedisTLSInsecureSkipVerify bool              // RedisTLSInsecureSkipVerify 表示是否跳过 TLS 证书校验
+}
+
+// clusterSlotsCompatClient 表示兼容读取旧版 ClusterSlots 的最小客户端能力。
+type clusterSlotsCompatClient interface {
+	ClusterSlots(ctx context.Context) *redis.ClusterSlotsCmd
 }
 
 // User 表示用户缓存对象。
@@ -107,7 +113,7 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 		tablecache.WithPrometheusSubsystem("tablecache"),
 	)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	// manager 是统一缓存管理器，负责读穿、刷新、日志和指标。
 	manager, err := tablecache.NewManager(store, []tablecache.Target{
@@ -130,12 +136,12 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 				// userID 是当前请求命中的用户 ID。
 				userID, err := strconv.ParseInt(keyParts[0], 10, 64)
 				if err != nil {
-					return nil, err
+					return nil, errors.Tag(err)
 				}
 				// user 是当前回源查到的用户数据。
 				user, err := model.FindOne(ctx, userID)
 				if err != nil {
-					return nil, err
+					return nil, errors.Tag(err)
 				}
 				if user == nil {
 					return nil, tablecache.ErrNotFound
@@ -154,7 +160,7 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 		tablecache.WithLoaderTimeout(500*time.Millisecond),
 	)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	return &UserCache{
 		manager: manager,
@@ -180,7 +186,7 @@ func (c *UserCache) GetForBiz(ctx context.Context, userID int64) (*User, error) 
 	// result 是当前读穿流程的最终读取状态。
 	result, err := c.manager.LoadThrough(ctx, c.key(userID), &user, nil)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	if result.State == tablecache.LookupStateHit {
 		return &user, nil
@@ -244,7 +250,7 @@ func NewServiceContext(config Config) (*ServiceContext, error) {
 	// client 是示例 Redis 通用客户端，兼容单节点和集群地址改写。
 	client, err := newRedisClient(config)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	// model 是示例内存数据源，真实项目可替换成 GORM、RPC 或其它仓储实现。
 	model := NewMemoryUserModel()
@@ -252,7 +258,7 @@ func NewServiceContext(config Config) (*ServiceContext, error) {
 	cache, err := NewUserCache(client, model)
 	if err != nil {
 		_ = client.Close()
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	return &ServiceContext{
 		Config:    config,
@@ -446,7 +452,7 @@ func newRedisClient(config Config) (redis.UniversalClient, error) {
 		})
 		if err := client.Ping(context.Background()).Err(); err != nil {
 			_ = client.Close()
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		return client, nil
 	}
@@ -460,12 +466,13 @@ func newRedisClient(config Config) (redis.UniversalClient, error) {
 	})
 	if err := client.Ping(context.Background()).Err(); err != nil {
 		_ = client.Close()
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	return client, nil
 }
 
 // loadClusterSlotsWithAddrMap 从任一可用种子节点读取槽位信息，并把容器 hostname 改写为宿主机地址。
+// Redis 7 及以上优先使用 ClusterShards；旧版本不支持时自动回退到 ClusterSlots。
 func loadClusterSlotsWithAddrMap(ctx context.Context, addrs []string, password string, tlsConfig *tls.Config, addrMap map[string]string) ([]redis.ClusterSlot, error) {
 	var lastErr error
 	for _, addr := range addrs {
@@ -474,20 +481,100 @@ func loadClusterSlotsWithAddrMap(ctx context.Context, addrs []string, password s
 			Password:  password,
 			TLSConfig: tlsConfig,
 		})
-		slots, err := seedClient.ClusterSlots(ctx).Result()
+		slots, err := loadClusterSlotsCompat(ctx, seedClient, addrMap)
 		_ = seedClient.Close()
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		for slotIndex, slot := range slots {
-			for nodeIndex, node := range slot.Nodes {
-				slots[slotIndex].Nodes[nodeIndex].Addr = rewriteClusterAddr(node.Addr, addrMap)
-			}
-		}
 		return slots, nil
 	}
 	return nil, lastErr
+}
+
+// loadClusterSlotsCompat 优先使用 ClusterShards；若目标 Redis 版本不支持，则自动回退到 ClusterSlots。
+func loadClusterSlotsCompat(ctx context.Context, seedClient *redis.Client, addrMap map[string]string) ([]redis.ClusterSlot, error) {
+	shards, err := seedClient.ClusterShards(ctx).Result()
+	if err == nil {
+		return clusterShardsToSlots(shards, addrMap), nil
+	}
+	if !isClusterShardsUnsupported(err) {
+		return nil, errors.Tag(err)
+	}
+	slots, err := loadLegacyClusterSlots(ctx, seedClient)
+	if err != nil {
+		return nil, err
+	}
+	for slotIndex, slot := range slots {
+		for nodeIndex, node := range slot.Nodes {
+			slots[slotIndex].Nodes[nodeIndex].Addr = rewriteClusterAddr(node.Addr, addrMap)
+		}
+	}
+	return slots, nil
+}
+
+// loadLegacyClusterSlots 通过旧版 ClusterSlots 命令读取槽位信息，作为 Redis 7 以下版本的兼容回退。
+func loadLegacyClusterSlots(ctx context.Context, client clusterSlotsCompatClient) ([]redis.ClusterSlot, error) {
+	slots, err := client.ClusterSlots(ctx).Result()
+	return slots, errors.Tag(err)
+}
+
+// clusterShardsToSlots 把 Redis 7 的 ClusterShards 结果转换成 go-redis ClusterSlots 回调需要的结构。
+func clusterShardsToSlots(shards []redis.ClusterShard, addrMap map[string]string) []redis.ClusterSlot {
+	slots := make([]redis.ClusterSlot, 0, len(shards))
+	for _, shard := range shards {
+		nodes := make([]redis.ClusterNode, 0, len(shard.Nodes))
+		for _, node := range shard.Nodes {
+			addr := rewriteClusterAddr(clusterShardNodeAddr(node), addrMap)
+			if strings.TrimSpace(addr) == "" {
+				continue
+			}
+			nodes = append(nodes, redis.ClusterNode{
+				ID:   node.ID,
+				Addr: addr,
+			})
+		}
+		for _, slotRange := range shard.Slots {
+			slots = append(slots, redis.ClusterSlot{
+				Start: int(slotRange.Start),
+				End:   int(slotRange.End),
+				Nodes: nodes,
+			})
+		}
+	}
+	return slots
+}
+
+// clusterShardNodeAddr 返回 ClusterShards 节点的可连接地址。
+func clusterShardNodeAddr(node redis.Node) string {
+	endpoint := strings.TrimSpace(node.Endpoint)
+	if endpoint != "" {
+		return endpoint
+	}
+	host := strings.TrimSpace(node.Hostname)
+	if host == "" {
+		host = strings.TrimSpace(node.IP)
+	}
+	if host == "" {
+		return ""
+	}
+	port := node.Port
+	if port <= 0 {
+		port = node.TLSPort
+	}
+	if port <= 0 {
+		return host
+	}
+	return net.JoinHostPort(host, strconv.FormatInt(port, 10))
+}
+
+// isClusterShardsUnsupported 判断当前错误是否表示 Redis 服务端不支持 ClusterShards。
+func isClusterShardsUnsupported(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "unknown command") && strings.Contains(message, "cluster") && strings.Contains(message, "shards")
 }
 
 // rewriteClusterAddr 按 addr_map 把集群返回的 hostname 改写为宿主机可访问地址。

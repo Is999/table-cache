@@ -4,9 +4,12 @@ import (
 	"context"
 	"time"
 
+	"github.com/Is999/go-utils/errors"
+
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// defaultRefreshEntryBuckets 表示单次刷新写入条数直方图默认桶。
 var defaultRefreshEntryBuckets = []float64{0, 1, 2, 5, 10, 20, 50, 100, 200, 500}
 
 // PrometheusMetricsOption 表示 Prometheus 指标适配器的可选配置。
@@ -108,7 +111,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index", "result"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshDuration, err = registerHistogramVec(config.Registerer, prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -121,7 +124,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index", "result"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.cacheHitTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -133,7 +136,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.cacheMissTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -145,7 +148,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.lockFailedTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -157,7 +160,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.loaderErrorTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -169,7 +172,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.emptyMarkerWriteTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -181,7 +184,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.waitTimeoutTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -193,7 +196,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.prefixWaitTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -205,7 +208,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.prefixRetryTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -217,7 +220,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.prefixDeleteTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -229,7 +232,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.prefixDeleteKeysTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -241,7 +244,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshEntryCount, err = registerHistogramVec(config.Registerer, prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -254,7 +257,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.lookupStateTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -266,7 +269,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index", "state"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.lookupRefreshTriggeredTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -278,7 +281,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"index"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshBatchTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -290,7 +293,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"mode", "result"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshBatchSize, err = registerHistogramVec(config.Registerer, prometheus.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -303,7 +306,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"mode", "result"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshBatchSuccessItems, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -315,7 +318,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"mode"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	metrics.refreshBatchFailedItems, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -327,7 +330,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		[]string{"mode"},
 	))
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	return metrics, nil
 }
@@ -412,11 +415,11 @@ func registerCounterVec(registerer prometheus.Registerer, counter *prometheus.Co
 	if err := registerer.Register(counter); err != nil {
 		existingError, ok := err.(prometheus.AlreadyRegisteredError)
 		if !ok {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		existingCounter, ok := existingError.ExistingCollector.(*prometheus.CounterVec)
 		if !ok {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		return existingCounter, nil
 	}
@@ -428,11 +431,11 @@ func registerHistogramVec(registerer prometheus.Registerer, histogram *prometheu
 	if err := registerer.Register(histogram); err != nil {
 		existingError, ok := err.(prometheus.AlreadyRegisteredError)
 		if !ok {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		existingHistogram, ok := existingError.ExistingCollector.(*prometheus.HistogramVec)
 		if !ok {
-			return nil, err
+			return nil, errors.Tag(err)
 		}
 		return existingHistogram, nil
 	}
