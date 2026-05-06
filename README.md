@@ -20,6 +20,8 @@
 - `Get` 提供统一读取和反序列化入口；`GetState` 可明确区分 `hit/miss/empty`；`GetOrRefresh`、`GetOrRefreshWithLoader`、`GetOrRefreshWithOptions`、`LoadThrough`、`LoadThroughWithOptions` 可封装“缓存读取 + 回源 + 回填 + 返回”的读穿闭环。
 - `LookupMetrics` 可补充 `lookup_state_hit/miss/empty` 与 `lookup_refresh_triggered` 等细分读取指标；`ExtendedMetrics` 还可补充 `prefix_wait`、`prefix_retry` 等前缀刷新排障指标。
 - `DeleteByKey`、`DeleteByPrefix` 只允许操作缓存管理器中已注册的目标 key 或前缀，并同步清理隐藏空值元信息和短 TTL 重建结果元信息，避免误删任意 Redis key。
+- Loader 返回的 `Entry.Key` 会在写回前校验作用域：固定目标只能写固定 key，前缀目标只能写注册前缀内 key，避免加载器误写非托管 Redis key。
+- Hash/List/Set/ZSet 返回真实空集合时会写入隐藏空集合元信息，使后续 `GetState` 明确返回 `hit`，避免把“空集合”误判成 `miss` 并反复回源。
 - `Entry.Overwrite` 可控制写入前是否先删除旧 key，默认覆盖写入；显式 `tablecache.Bool(false)` 时按 Redis 结构增量更新。
 - `LoaderTimeout` 与 `WithRebuildContextPolicy(...)` 可限制单次回源时长，并控制是否继承调用方取消信号。
 - 前缀刷新采用分层互斥：前缀全量刷新独占前缀锁，同前缀单 key 刷新使用 key 级锁；若遇到全量刷新，会先等待，必要时重试，兼顾一致性和并发度。

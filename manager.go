@@ -58,6 +58,8 @@ var (
 	ErrCacheMiss = errors.New("tablecache cache miss")
 	// ErrNotFound 表示加载器确认源数据不存在，可触发空值占位。
 	ErrNotFound = errors.New("tablecache data not found")
+	// ErrEntryKeyOutOfScope 表示加载器返回了不属于当前缓存目标管理范围的写入 key。
+	ErrEntryKeyOutOfScope = errors.New("tablecache entry key out of target scope")
 	// errPrefixRefreshBusy 表示当前单 key 刷新遇到同前缀全量刷新，应等待后重试。
 	errPrefixRefreshBusy = errors.New("tablecache prefix refresh busy")
 )
@@ -501,7 +503,7 @@ func (m *Manager) DeleteByKey(ctx context.Context, key string) error {
 	if _, _, err := m.resolve(key, nil); err != nil {
 		return errors.Tag(err)
 	}
-	return m.store.Delete(ctx, key, m.emptyKey(key), m.rebuildResultKey(key))
+	return m.store.Delete(ctx, key, m.emptyKey(key), m.emptyCollectionKey(key), m.rebuildResultKey(key))
 }
 
 // DeleteByPrefix 删除指定 Redis key 前缀下的所有缓存。
@@ -517,6 +519,7 @@ func (m *Manager) DeleteByPrefix(ctx context.Context, prefix string) error {
 	patterns := []string{
 		target.Key + "*",
 		m.emptyKey(target.Key) + "*",
+		m.emptyCollectionKey(target.Key) + "*",
 		m.rebuildResultKey(target.Key) + "*",
 	}
 	var totalCount int64
@@ -774,24 +777,43 @@ func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Con
 func (m *Manager) writeRefreshEntries(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry) error {
 	for index, entry := range entries {
 		entries[index] = m.withTargetDefaults(target, entry)
+		if err := m.validateRefreshEntryScope(target, entries[index]); err != nil {
+			return errors.Tag(err)
+		}
 	}
 	if len(entries) == 0 {
 		return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
 	}
-	emptyKeys := make([]string, 0, len(entries))
+	normalEntries := make([]Entry, 0, len(entries))
+	emptyCollectionEntries := make([]Entry, 0)
 	for _, entry := range entries {
-		if strings.TrimSpace(entry.Key) == "" {
-			continue
+		if isEmptyCollectionEntry(entry) {
+			emptyCollectionEntries = append(emptyCollectionEntries, entry)
+		} else {
+			normalEntries = append(normalEntries, entry)
 		}
-		emptyKeys = append(emptyKeys, m.emptyKey(entry.Key))
 	}
-	if len(emptyKeys) > 0 {
-		if err := m.store.Delete(rebuildCtx, emptyKeys...); err != nil {
+	cleanupKeys := make([]string, 0, len(entries)*2)
+	for _, entry := range normalEntries {
+		cleanupKeys = append(cleanupKeys, m.emptyKey(entry.Key), m.emptyCollectionKey(entry.Key))
+	}
+	for _, entry := range emptyCollectionEntries {
+		cleanupKeys = append(cleanupKeys, entry.Key, m.emptyKey(entry.Key))
+	}
+	if len(cleanupKeys) > 0 {
+		if err := m.store.Delete(rebuildCtx, cleanupKeys...); err != nil {
 			return errors.Tag(err)
 		}
 	}
-	if err := m.store.WriteBatch(rebuildCtx, entries); err != nil {
-		return errors.Tag(err)
+	if len(normalEntries) > 0 {
+		if err := m.store.WriteBatch(rebuildCtx, normalEntries); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	if len(emptyCollectionEntries) > 0 {
+		if err := m.writeEmptyCollectionMarkers(rebuildCtx, emptyCollectionEntries); err != nil {
+			return errors.Tag(err)
+		}
 	}
 	m.recordRefreshEntryCount(ctx, target.Index, len(entries))
 	return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
@@ -801,6 +823,9 @@ func (m *Manager) writeRefreshEntries(ctx context.Context, rebuildCtx context.Co
 func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry, wroteHiddenEmptyMarker bool, options refreshOptions, fieldsReadyName string) error {
 	if len(entries) == 0 && wroteHiddenEmptyMarker {
 		if err := m.deleteBusinessKey(rebuildCtx, target, key); err != nil {
+			return errors.Tag(err)
+		}
+		if err := m.store.Delete(rebuildCtx, m.emptyCollectionKey(key)); err != nil {
 			return errors.Tag(err)
 		}
 	}
@@ -1088,6 +1113,18 @@ func (m *Manager) lookup(ctx context.Context, target Target, params LoadParams, 
 				m.recordLookupState(ctx, target.Index, LookupStateEmpty)
 				return LookupResult{State: LookupStateEmpty}, nil
 			}
+			emptyCollection, emptyCollectionErr := m.hasEmptyCollectionMarker(ctx, target, params.Key)
+			if emptyCollectionErr != nil {
+				return LookupResult{}, emptyCollectionErr
+			}
+			if emptyCollection {
+				if err := m.decodeValue(emptyCollectionValue(target.Type), dest); err != nil {
+					return LookupResult{}, errors.Tag(err)
+				}
+				m.recordCacheHit(ctx, target.Index)
+				m.recordLookupState(ctx, target.Index, LookupStateHit)
+				return LookupResult{State: LookupStateHit}, nil
+			}
 			m.recordCacheMiss(ctx, target.Index)
 			m.recordLookupState(ctx, target.Index, LookupStateMiss)
 			return LookupResult{State: LookupStateMiss}, nil
@@ -1119,6 +1156,80 @@ func (m *Manager) withTargetDefaults(target Target, entry Entry) Entry {
 		entry.Jitter = target.Jitter
 	}
 	return entry
+}
+
+// validateRefreshEntryScope 确保 Loader 只能写入当前注册目标管理范围内的 key。
+func (m *Manager) validateRefreshEntryScope(target Target, entry Entry) error {
+	entryKey := strings.TrimSpace(entry.Key)
+	if entryKey == "" {
+		return errors.Errorf("Redis缓存key不能为空")
+	}
+	if strings.HasSuffix(target.Key, ":") {
+		if strings.HasPrefix(entryKey, target.Key) {
+			return nil
+		}
+		return errors.Wrapf(ErrEntryKeyOutOfScope, "缓存写入key[%s]不属于目标前缀[%s]", entryKey, target.Key)
+	}
+	if entryKey == target.Key {
+		return nil
+	}
+	return errors.Wrapf(ErrEntryKeyOutOfScope, "缓存写入key[%s]不等于固定目标key[%s]", entryKey, target.Key)
+}
+
+// isEmptyCollectionEntry 判断 Entry 是否表示一个真实存在但内容为空的 Redis 集合结构。
+func isEmptyCollectionEntry(entry Entry) bool {
+	if !isCollectionType(entry.Type) {
+		return false
+	}
+	if entry.Value == nil {
+		return true
+	}
+	value := reflect.ValueOf(entry.Value)
+	switch value.Kind() {
+	case reflect.Map, reflect.Slice, reflect.Array:
+		return value.Len() == 0
+	default:
+		return false
+	}
+}
+
+// isCollectionType 判断 Redis 类型是否无法原生持久化空结构。
+func isCollectionType(typ CacheType) bool {
+	switch typ {
+	case TypeHash, TypeList, TypeSet, TypeZSet:
+		return true
+	default:
+		return false
+	}
+}
+
+// emptyCollectionValue 返回空集合 marker 命中时用于反序列化的零元素值。
+func emptyCollectionValue(typ CacheType) any {
+	switch typ {
+	case TypeHash:
+		return map[string]string{}
+	case TypeList, TypeSet:
+		return []string{}
+	case TypeZSet:
+		return []ZMember{}
+	default:
+		return nil
+	}
+}
+
+// writeEmptyCollectionMarkers 写入真实空集合元信息，避免空集合被误判为缓存 miss。
+func (m *Manager) writeEmptyCollectionMarkers(ctx context.Context, entries []Entry) error {
+	markerEntries := make([]Entry, 0, len(entries))
+	for _, entry := range entries {
+		markerEntries = append(markerEntries, Entry{
+			Key:    m.emptyCollectionKey(entry.Key),
+			Type:   TypeString,
+			Value:  m.emptyMarker,
+			TTL:    entry.TTL,
+			Jitter: entry.Jitter,
+		})
+	}
+	return m.store.WriteBatch(ctx, markerEntries)
 }
 
 // startLockRenew 在加载器运行期间定时续期当前实例持有的锁。
@@ -1318,6 +1429,15 @@ func (m *Manager) emptyKey(key string) string {
 		key = "unknown"
 	}
 	return "tablecache:empty:" + key
+}
+
+// emptyCollectionKey 返回真实空集合元信息 key。
+func (m *Manager) emptyCollectionKey(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "unknown"
+	}
+	return "tablecache:empty_collection:" + key
 }
 
 // newLockValue 生成锁持有者标识，用于释放锁时确认只删除自己的锁。
@@ -1740,6 +1860,14 @@ func (m *Manager) hasHiddenEmptyMarker(ctx context.Context, target Target, key s
 	return m.store.Exists(ctx, m.emptyKey(key))
 }
 
+// hasEmptyCollectionMarker 判断当前 key 是否存在真实空集合元信息。
+func (m *Manager) hasEmptyCollectionMarker(ctx context.Context, target Target, key string) (bool, error) {
+	if !isCollectionType(target.Type) {
+		return false, nil
+	}
+	return m.store.Exists(ctx, m.emptyCollectionKey(key))
+}
+
 // writeHiddenEmptyMarker 写入隐藏空值占位元信息，避免业务 key 与空占位发生值碰撞。
 func (m *Manager) writeHiddenEmptyMarker(ctx context.Context, target Target, key string) error {
 	ttl := target.EmptyTTL
@@ -1756,7 +1884,7 @@ func (m *Manager) writeHiddenEmptyMarker(ctx context.Context, target Target, key
 
 // deleteRefreshedKey 删除当前刷新目标的业务 key 和隐藏空值元信息，避免空结果保留历史脏数据。
 func (m *Manager) deleteRefreshedKey(ctx context.Context, target Target, key string) error {
-	keys := []string{m.emptyKey(key)}
+	keys := []string{m.emptyKey(key), m.emptyCollectionKey(key)}
 	if !(strings.HasSuffix(target.Key, ":") && key == target.Key) {
 		keys = append(keys, key)
 	}

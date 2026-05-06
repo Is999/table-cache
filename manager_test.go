@@ -225,6 +225,173 @@ func TestManagerZSetEmptyMarker(t *testing.T) {
 	}
 }
 
+// TestManagerRejectsOutOfScopeEntryKeys 验证 Loader 不能越过已注册目标范围写入 Redis key。
+func TestManagerRejectsOutOfScopeEntryKeys(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "scope",
+			Title: "作用域缓存",
+			Key:   "scope:",
+			Type:  TypeString,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				return []Entry{{Key: "other:1", Type: TypeString, Value: "bad"}}, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	err = manager.RefreshByKey(ctx, "scope:1")
+	if !errors.Is(err, ErrEntryKeyOutOfScope) {
+		t.Fatalf("RefreshByKey(scope:1) error = %v, want ErrEntryKeyOutOfScope", err)
+	}
+	if exists := client.Exists(ctx, "other:1").Val(); exists != 0 {
+		t.Fatalf("other:1 exists = %d, want 0", exists)
+	}
+}
+
+// TestManagerEmptyCollectionEntriesHit 验证真实空集合会被记录为命中，而不是反复 miss 回源。
+func TestManagerEmptyCollectionEntriesHit(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	cases := []struct {
+		name  string
+		typ   CacheType
+		key   string
+		value any
+		dest  any
+		check func(t *testing.T, dest any)
+	}{
+		{
+			name:  "hash",
+			typ:   TypeHash,
+			key:   "empty-hash:1",
+			value: map[string]any{},
+			dest:  &map[string]string{},
+			check: func(t *testing.T, dest any) {
+				if got := *(dest.(*map[string]string)); len(got) != 0 {
+					t.Fatalf("hash dest = %#v, want empty", got)
+				}
+			},
+		},
+		{
+			name:  "list",
+			typ:   TypeList,
+			key:   "empty-list:1",
+			value: []any{},
+			dest:  &[]string{},
+			check: func(t *testing.T, dest any) {
+				if got := *(dest.(*[]string)); len(got) != 0 {
+					t.Fatalf("list dest = %#v, want empty", got)
+				}
+			},
+		},
+		{
+			name:  "set",
+			typ:   TypeSet,
+			key:   "empty-set:1",
+			value: []string{},
+			dest:  &[]string{},
+			check: func(t *testing.T, dest any) {
+				if got := *(dest.(*[]string)); len(got) != 0 {
+					t.Fatalf("set dest = %#v, want empty", got)
+				}
+			},
+		},
+		{
+			name:  "zset",
+			typ:   TypeZSet,
+			key:   "empty-zset:1",
+			value: []ZMember{},
+			dest:  &[]ZMember{},
+			check: func(t *testing.T, dest any) {
+				if got := *(dest.(*[]ZMember)); len(got) != 0 {
+					t.Fatalf("zset dest = %#v, want empty", got)
+				}
+			},
+		},
+	}
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			manager, err := NewManager(NewRedisStore(client), []Target{
+				{
+					Index: tt.name,
+					Title: tt.name,
+					Key:   strings.TrimSuffix(tt.key, "1"),
+					Type:  tt.typ,
+					Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+						return []Entry{{Key: params.Key, Type: tt.typ, Value: tt.value}}, nil
+					},
+				},
+			})
+			if err != nil {
+				t.Fatalf("NewManager() error = %v", err)
+			}
+			if err := manager.RefreshByKey(ctx, tt.key); err != nil {
+				t.Fatalf("RefreshByKey(%s) error = %v", tt.key, err)
+			}
+			if exists := client.Exists(ctx, tt.key).Val(); exists != 0 {
+				t.Fatalf("%s business key exists = %d, want 0", tt.key, exists)
+			}
+			if exists := client.Exists(ctx, manager.emptyCollectionKey(tt.key)).Val(); exists != 1 {
+				t.Fatalf("%s empty collection marker exists = %d, want 1", tt.key, exists)
+			}
+			result, err := manager.GetState(ctx, tt.key, tt.dest)
+			if err != nil {
+				t.Fatalf("GetState(%s) error = %v", tt.key, err)
+			}
+			if result.State != LookupStateHit {
+				t.Fatalf("GetState(%s) state = %s, want hit", tt.key, result.State)
+			}
+			tt.check(t, tt.dest)
+		})
+	}
+}
+
+// TestManagerEmptyCollectionMarkerClearedByNormalWrite 验证空集合元信息会在后续正常写入时清理。
+func TestManagerEmptyCollectionMarkerClearedByNormalWrite(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	var calls atomic.Int64
+	manager, err := NewManager(NewRedisStore(client), []Target{
+		{
+			Index: "empty-clear",
+			Title: "空集合清理",
+			Key:   "empty-clear:",
+			Type:  TypeList,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				if calls.Add(1) == 1 {
+					return []Entry{{Key: params.Key, Type: TypeList, Value: []string{}}}, nil
+				}
+				return []Entry{{Key: params.Key, Type: TypeList, Value: []string{"alpha"}}}, nil
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewManager() error = %v", err)
+	}
+	if err := manager.RefreshByKey(ctx, "empty-clear:1"); err != nil {
+		t.Fatalf("RefreshByKey(empty-clear:1) first error = %v", err)
+	}
+	if exists := client.Exists(ctx, manager.emptyCollectionKey("empty-clear:1")).Val(); exists != 1 {
+		t.Fatalf("empty collection marker exists = %d, want 1", exists)
+	}
+	if err := manager.RefreshByKey(ctx, "empty-clear:1"); err != nil {
+		t.Fatalf("RefreshByKey(empty-clear:1) second error = %v", err)
+	}
+	if exists := client.Exists(ctx, manager.emptyCollectionKey("empty-clear:1")).Val(); exists != 0 {
+		t.Fatalf("empty collection marker exists after normal write = %d, want 0", exists)
+	}
+	if got := client.LRange(ctx, "empty-clear:1", 0, -1).Val(); len(got) != 1 || got[0] != "alpha" {
+		t.Fatalf("empty-clear:1 list = %#v, want alpha", got)
+	}
+}
+
 // TestManagerWaitRebuildTimeout 验证等待其它实例重建超时时返回明确错误。
 func TestManagerWaitRebuildTimeout(t *testing.T) {
 	ctx := context.Background()
