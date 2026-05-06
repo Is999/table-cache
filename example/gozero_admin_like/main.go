@@ -523,16 +523,26 @@ func loadLegacyClusterSlots(ctx context.Context, client clusterSlotsCompatClient
 func clusterShardsToSlots(shards []redis.ClusterShard, addrMap map[string]string) []redis.ClusterSlot {
 	slots := make([]redis.ClusterSlot, 0, len(shards))
 	for _, shard := range shards {
-		nodes := make([]redis.ClusterNode, 0, len(shard.Nodes))
+		masters := make([]redis.ClusterNode, 0, 1)
+		replicas := make([]redis.ClusterNode, 0, len(shard.Nodes))
 		for _, node := range shard.Nodes {
 			addr := rewriteClusterAddr(clusterShardNodeAddr(node), addrMap)
 			if strings.TrimSpace(addr) == "" {
 				continue
 			}
-			nodes = append(nodes, redis.ClusterNode{
+			clusterNode := redis.ClusterNode{
 				ID:   node.ID,
 				Addr: addr,
-			})
+			}
+			if strings.EqualFold(node.Role, "master") {
+				masters = append(masters, clusterNode)
+			} else {
+				replicas = append(replicas, clusterNode)
+			}
+		}
+		nodes := append(masters, replicas...)
+		if len(nodes) == 0 {
+			continue
 		}
 		for _, slotRange := range shard.Slots {
 			slots = append(slots, redis.ClusterSlot{
@@ -547,16 +557,18 @@ func clusterShardsToSlots(shards []redis.ClusterShard, addrMap map[string]string
 
 // clusterShardNodeAddr 返回 ClusterShards 节点的可连接地址。
 func clusterShardNodeAddr(node redis.Node) string {
-	endpoint := strings.TrimSpace(node.Endpoint)
-	if endpoint != "" {
-		return endpoint
+	host := strings.TrimSpace(node.Endpoint)
+	if host == "" {
+		host = strings.TrimSpace(node.Hostname)
 	}
-	host := strings.TrimSpace(node.Hostname)
 	if host == "" {
 		host = strings.TrimSpace(node.IP)
 	}
 	if host == "" {
 		return ""
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
 	}
 	port := node.Port
 	if port <= 0 {

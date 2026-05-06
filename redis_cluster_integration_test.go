@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,9 +22,100 @@ type clusterIntegrationConfig struct {
 	PoolSize int               // PoolSize 是连接池大小
 }
 
+// singleIntegrationConfig 表示真实单机 Redis 集成测试配置。
+type singleIntegrationConfig struct {
+	Addr     string // Addr 是单机 Redis 地址
+	Password string // Password 是 Redis 认证密码
+	DB       int    // DB 是 Redis DB 编号
+	PoolSize int    // PoolSize 是连接池大小
+}
+
 // clusterSlotsCompatTestClient 表示测试里兼容读取旧版 ClusterSlots 的最小客户端能力。
 type clusterSlotsCompatTestClient interface {
 	ClusterSlots(ctx context.Context) *redis.ClusterSlotsCmd
+}
+
+// TestRedisSingleIntegration 验证真实单机 Redis 环境下的关键缓存能力。
+func TestRedisSingleIntegration(t *testing.T) {
+	config, ok := loadSingleIntegrationConfig()
+	if !ok {
+		t.Skip("未配置真实单机 Redis 集成测试环境变量，跳过集成测试")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	client := redis.NewClient(&redis.Options{
+		Addr:     config.Addr,
+		Password: config.Password,
+		DB:       config.DB,
+		PoolSize: config.PoolSize,
+	})
+	if err := client.Ping(ctx).Err(); err != nil {
+		_ = client.Close()
+		t.Fatalf("single redis ping error = %v", err)
+	}
+	defer client.Close()
+	store := NewRedisStore(client)
+	prefix := fmt.Sprintf("itc:single:%d:", time.Now().UnixNano())
+	t.Cleanup(func() {
+		_, _ = store.DeletePattern(context.Background(), prefix+"*", defaultScanCount)
+		_, _ = store.DeletePattern(context.Background(), "tablecache:*"+prefix+"*", defaultScanCount)
+	})
+
+	t.Run("store write and pattern delete", func(t *testing.T) {
+		err := store.WriteBatch(ctx, []Entry{
+			{Key: prefix + "string", Type: TypeString, Value: "ok"},
+			{Key: prefix + "hash", Type: TypeHash, Value: map[string]any{"name": "alpha"}},
+			{Key: prefix + "list", Type: TypeList, Value: []string{"a", "b"}},
+		})
+		if err != nil {
+			t.Fatalf("WriteBatch() error = %v", err)
+		}
+		deleted, err := store.DeletePattern(ctx, prefix+"*", defaultScanCount)
+		if err != nil {
+			t.Fatalf("DeletePattern() error = %v", err)
+		}
+		if deleted < 3 {
+			t.Fatalf("DeletePattern() deleted = %d, want >= 3", deleted)
+		}
+	})
+
+	t.Run("manager load through and delete guard", func(t *testing.T) {
+		manager, err := NewManager(store, []Target{
+			{
+				Index: "single_itc",
+				Title: "单机集成测试缓存",
+				Key:   prefix,
+				Type:  TypeString,
+				Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+					return []Entry{{Key: params.Key, Type: TypeString, Value: "value:" + params.Key}}, nil
+				},
+			},
+		})
+		if err != nil {
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		var value string
+		result, err := manager.LoadThrough(ctx, prefix+"1", &value, nil)
+		if err != nil {
+			t.Fatalf("LoadThrough() error = %v", err)
+		}
+		if result.State != LookupStateHit || !result.Refreshed || value != "value:"+prefix+"1" {
+			t.Fatalf("LoadThrough() result=%+v value=%q, want refreshed hit/value", result, value)
+		}
+		if err := manager.DeleteByKey(ctx, "other:1"); err == nil || !errors.Is(err, ErrTargetNotFound) {
+			t.Fatalf("DeleteByKey(other:1) error = %v, want ErrTargetNotFound", err)
+		}
+		if err := manager.DeleteByPrefix(ctx, prefix); err != nil {
+			t.Fatalf("DeleteByPrefix() error = %v", err)
+		}
+		exists, err := client.Exists(ctx, prefix+"1").Result()
+		if err != nil {
+			t.Fatalf("Exists(%s) error = %v", prefix+"1", err)
+		}
+		if exists != 0 {
+			t.Fatalf("%s exists = %d, want 0", prefix+"1", exists)
+		}
+	})
 }
 
 // TestRedisClusterIntegration 验证真实 Redis Cluster 环境下的关键缓存能力。
@@ -146,6 +238,21 @@ func TestRedisClusterIntegration(t *testing.T) {
 	})
 }
 
+// loadSingleIntegrationConfig 读取真实单机 Redis 集成测试配置。
+func loadSingleIntegrationConfig() (singleIntegrationConfig, bool) {
+	addr := strings.TrimSpace(os.Getenv("TABLECACHE_REDIS_SINGLE_ADDR"))
+	if addr == "" {
+		return singleIntegrationConfig{}, false
+	}
+	db, _ := strconv.Atoi(strings.TrimSpace(os.Getenv("TABLECACHE_REDIS_SINGLE_DB")))
+	return singleIntegrationConfig{
+		Addr:     addr,
+		Password: os.Getenv("TABLECACHE_REDIS_SINGLE_PASSWORD"),
+		DB:       db,
+		PoolSize: 20,
+	}, true
+}
+
 // loadClusterIntegrationConfig 读取真实 Redis Cluster 集成测试配置。
 func loadClusterIntegrationConfig() (clusterIntegrationConfig, bool) {
 	addrsText := strings.TrimSpace(os.Getenv("TABLECACHE_REDIS_CLUSTER_ADDRS"))
@@ -232,16 +339,26 @@ func loadLegacyClusterSlotsForTest(ctx context.Context, client clusterSlotsCompa
 func clusterShardsToSlotsForTest(shards []redis.ClusterShard, addrMap map[string]string) []redis.ClusterSlot {
 	slots := make([]redis.ClusterSlot, 0, len(shards))
 	for _, shard := range shards {
-		nodes := make([]redis.ClusterNode, 0, len(shard.Nodes))
+		masters := make([]redis.ClusterNode, 0, 1)
+		replicas := make([]redis.ClusterNode, 0, len(shard.Nodes))
 		for _, node := range shard.Nodes {
 			addr := rewriteClusterAddr(clusterShardNodeAddrForTest(node), addrMap)
 			if strings.TrimSpace(addr) == "" {
 				continue
 			}
-			nodes = append(nodes, redis.ClusterNode{
+			clusterNode := redis.ClusterNode{
 				ID:   node.ID,
 				Addr: addr,
-			})
+			}
+			if strings.EqualFold(node.Role, "master") {
+				masters = append(masters, clusterNode)
+			} else {
+				replicas = append(replicas, clusterNode)
+			}
+		}
+		nodes := append(masters, replicas...)
+		if len(nodes) == 0 {
+			continue
 		}
 		for _, slotRange := range shard.Slots {
 			slots = append(slots, redis.ClusterSlot{
@@ -256,16 +373,18 @@ func clusterShardsToSlotsForTest(shards []redis.ClusterShard, addrMap map[string
 
 // clusterShardNodeAddrForTest 返回 ClusterShards 节点的可连接地址。
 func clusterShardNodeAddrForTest(node redis.Node) string {
-	endpoint := strings.TrimSpace(node.Endpoint)
-	if endpoint != "" {
-		return endpoint
+	host := strings.TrimSpace(node.Endpoint)
+	if host == "" {
+		host = strings.TrimSpace(node.Hostname)
 	}
-	host := strings.TrimSpace(node.Hostname)
 	if host == "" {
 		host = strings.TrimSpace(node.IP)
 	}
 	if host == "" {
 		return ""
+	}
+	if _, _, err := net.SplitHostPort(host); err == nil {
+		return host
 	}
 	port := node.Port
 	if port <= 0 {

@@ -52,10 +52,14 @@ func (e *PipelineExecError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if len(e.FailedKeys) == 0 {
-		return fmt.Sprintf("tablecache pipeline exec failed op=%s", e.Operation)
+	cause := ""
+	if e.Cause != nil {
+		cause = fmt.Sprintf(" cause=%v", e.Cause)
 	}
-	return fmt.Sprintf("tablecache pipeline exec failed op=%s failed_keys=%d", e.Operation, len(e.FailedKeys))
+	if len(e.FailedKeys) == 0 {
+		return fmt.Sprintf("tablecache pipeline exec failed op=%s%s", e.Operation, cause)
+	}
+	return fmt.Sprintf("tablecache pipeline exec failed op=%s failed_keys=%d%s", e.Operation, len(e.FailedKeys), cause)
 }
 
 func (e *PipelineExecError) Unwrap() error {
