@@ -90,7 +90,7 @@ func TestRedisSingleIntegration(t *testing.T) {
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "value:" + params.Key}}, nil
 				},
 			},
-		})
+		}, WithKeyPrefix(""))
 		if err != nil {
 			t.Fatalf("NewManager() error = %v", err)
 		}
@@ -191,6 +191,50 @@ func TestRedisClusterIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("manager prefix index delete", func(t *testing.T) {
+		manager, err := NewManager(store, []Target{
+			{
+				Index: "cluster_index_itc",
+				Title: "集群索引删除测试缓存",
+				Key:   prefix,
+				Type:  TypeString,
+				Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+					return []Entry{
+						{Key: prefix + "indexed:1", Type: TypeString, Value: "one"},
+						{Key: prefix + "indexed:2", Type: TypeString, Value: "two"},
+					}, nil
+				},
+			},
+		}, WithKeyPrefix(""), WithPrefixKeyIndexTTL(time.Hour))
+		if err != nil {
+			t.Fatalf("NewManager(index) error = %v", err)
+		}
+		if err := manager.RefreshByKey(ctx, prefix); err != nil {
+			t.Fatalf("RefreshByKey(prefix) error = %v", err)
+		}
+		target := manager.prefixTargetsM[prefix]        // target 表示当前集群集成测试的前缀目标，用于定位内部索引可信标记
+		readyKey := manager.prefixIndexReadyKey(target) // readyKey 存在说明索引已覆盖一次完整全量刷新，DeleteByPrefix 会走索引快路径
+		exists, err := client.Exists(ctx, readyKey).Result()
+		if err != nil {
+			t.Fatalf("Exists(%s) error = %v", readyKey, err)
+		}
+		if exists != 1 {
+			t.Fatalf("prefix index ready exists = %d, want 1", exists)
+		}
+		if err := manager.DeleteByPrefix(ctx, prefix); err != nil {
+			t.Fatalf("DeleteByPrefix(indexed prefix) error = %v", err)
+		}
+		for _, key := range []string{prefix + "indexed:1", prefix + "indexed:2", readyKey} {
+			exists, err := client.Exists(ctx, key).Result()
+			if err != nil {
+				t.Fatalf("Exists(%s) error = %v", key, err)
+			}
+			if exists != 0 {
+				t.Fatalf("key %s exists = %d, want 0", key, exists)
+			}
+		}
+	})
+
 	t.Run("manager registered key guard", func(t *testing.T) {
 		manager, err := NewManager(store, []Target{
 			{
@@ -202,7 +246,7 @@ func TestRedisClusterIntegration(t *testing.T) {
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "value:" + params.Key}}, nil
 				},
 			},
-		}, WithWait(50*time.Millisecond, 20))
+		}, WithKeyPrefix(""), WithWait(50*time.Millisecond, 20))
 		if err != nil {
 			t.Fatalf("NewManager() error = %v", err)
 		}
@@ -303,7 +347,7 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 		return slots, nil
 	}
 	if lastErr == nil {
-		lastErr = fmt.Errorf("没有可用的 Redis Cluster 种子节点")
+		lastErr = errors.New("没有可用的 Redis Cluster 种子节点")
 	}
 	return nil, lastErr
 }

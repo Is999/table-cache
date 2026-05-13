@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	utils "github.com/Is999/go-utils"
@@ -24,6 +25,8 @@ import (
 const (
 	// defaultLockTTL 表示缓存重建锁默认持有时间。
 	defaultLockTTL = 10 * time.Second
+	// defaultKeyPrefix 表示业务缓存 key 的默认命名空间前缀，用于和非 tablecache 管理的 Redis key 隔离。
+	defaultKeyPrefix = "tablecache:data:"
 	// defaultWaitStepMin 表示默认动态等待策略的最小轮询间隔。
 	defaultWaitStepMin = 50 * time.Millisecond
 	// defaultWaitStepMax 表示默认动态等待策略的最大轮询间隔。
@@ -31,11 +34,15 @@ const (
 	// defaultEmptyTTL 表示空值占位缓存默认过期时间。
 	defaultEmptyTTL = 2 * time.Minute
 	// defaultScanCount 表示清理前缀缓存时 Redis SCAN 的单次扫描数量。
-	defaultScanCount = int64(100)
+	defaultScanCount = int64(1000)
+	// defaultPrefixDeleteConcurrency 表示 DeleteByPrefix 默认按 pattern 串行删除，避免默认清理任务过度抢占 Redis。
+	defaultPrefixDeleteConcurrency = 1
 	// defaultRebuildResultTTL 表示重建完成元信息默认保留时间。
 	defaultRebuildResultTTL = 30 * time.Second
 	// defaultPrefixEpochTTL 表示前缀全量刷新代际元信息默认保留时间，避免长期运行产生无限元信息堆积。
 	defaultPrefixEpochTTL = 7 * 24 * time.Hour
+	// defaultPrefixKeyIndexTTL 表示前缀 key 索引默认保留时间；过期后会自动降级全库 SCAN，避免索引长期无人维护。
+	defaultPrefixKeyIndexTTL = 30 * 24 * time.Hour
 	// defaultRefreshConcurrency 表示批量刷新默认并发度，1 表示保守串行。
 	defaultRefreshConcurrency = 1
 )
@@ -58,6 +65,10 @@ var (
 	ErrCacheMiss = errors.New("tablecache cache miss")
 	// ErrNotFound 表示加载器确认源数据不存在，可触发空值占位。
 	ErrNotFound = errors.New("tablecache data not found")
+	// ErrKeyPrefixRequired 表示刷新、删除或写回操作必须使用已带 Manager 指定前缀的实际 Redis key。
+	ErrKeyPrefixRequired = errors.New("tablecache key prefix required")
+	// ErrInvalidClusterHashTag 表示 key 中的花括号无法安全生成 Redis Cluster 同槽元信息 key。
+	ErrInvalidClusterHashTag = errors.New("tablecache invalid redis cluster hash tag key")
 	// ErrEntryKeyOutOfScope 表示加载器返回了不属于当前缓存目标管理范围的写入 key。
 	ErrEntryKeyOutOfScope = errors.New("tablecache entry key out of target scope")
 	// errPrefixRefreshBusy 表示当前单 key 刷新遇到同前缀全量刷新，应等待后重试。
@@ -69,29 +80,33 @@ type Option func(*Manager)
 
 // Manager 管理一组表数据缓存目标，负责刷新、锁保护、TTL 抖动与空值占位。
 type Manager struct {
-	store          Store                // store 是底层缓存存储适配器
-	targets        map[string]Target    // targets 按索引保存缓存目标
-	ordered        []Target             // ordered 保留配置顺序，便于列表展示和批量刷新
-	fixedKeys      map[string]Target    // fixedKeys 用于加速固定 key 的精确匹配
-	prefixTargets  []Target             // prefixTargets 仅包含前缀型目标，并按 key 长度降序排列以确保最长前缀优先
-	prefixTargetsM map[string]Target    // prefixTargetsM 用于 DeleteByPrefix 等场景快速校验前缀是否已注册
-	lockTTL        time.Duration        // lockTTL 是缓存重建锁持有时间
-	waitStep       time.Duration        // waitStep 是等待其它实例重建时的轮询间隔
-	waitTimes      int                  // waitTimes 是等待其它实例重建的最大次数
-	waitConfigured bool                 // waitConfigured 标识是否显式配置了等待策略
-	emptyMarker    string               // emptyMarker 是空值缓存占位内容
-	emptyTTL       time.Duration        // emptyTTL 是空值缓存默认过期时间
-	scanCount      int64                // scanCount 是清理前缀缓存时的 SCAN count
-	lockRenew      time.Duration        // lockRenew 是缓存重建锁续期间隔，0 表示按 lockTTL 自动计算
-	resultTTL      time.Duration        // resultTTL 是重建完成元信息保留时间
-	prefixEpochTTL time.Duration        // prefixEpochTTL 是前缀全量刷新代际元信息保留时间
-	loaderTTL      time.Duration        // loaderTTL 是默认 Loader 超时时间，0 表示不额外设置超时
-	ctxPolicy      RebuildContextPolicy // ctxPolicy 是缓存重建上下文取消策略
-	concurrency    int                  // concurrency 是批量刷新并发度
-	logger         Logger               // logger 是可选日志适配器
-	metrics        Metrics              // metrics 是可选运行指标记录器
-	decoder        Decoder              // decoder 是缓存读取反序列化函数
-	group          singleflight.Group   // group 合并进程内相同 key 的并发刷新请求
+	store                   Store                // store 是底层缓存存储适配器
+	targets                 map[string]Target    // targets 按目标 Index 保存缓存配置，key 为业务声明的唯一索引，value 为已归一化目标
+	ordered                 []Target             // ordered 保留配置顺序，便于列表展示和批量刷新
+	fixedKeys               map[string]Target    // fixedKeys 按实际 Redis key 保存固定目标，key 为带命名空间后的完整缓存 key
+	prefixTargets           []Target             // prefixTargets 仅包含前缀型目标，并按 key 长度降序排列以确保最长前缀优先
+	prefixTargetsM          map[string]Target    // prefixTargetsM 按实际 Redis 前缀保存前缀目标，key 为带命名空间后的缓存前缀
+	keyPrefix               string               // keyPrefix 是业务缓存 key 命名空间前缀，避免误删或覆盖非托管 Redis key
+	lockTTL                 time.Duration        // lockTTL 是缓存重建锁持有时间
+	waitStep                time.Duration        // waitStep 是等待其它实例重建时的轮询间隔
+	waitTimes               int                  // waitTimes 是等待其它实例重建的最大次数
+	waitConfigured          bool                 // waitConfigured 标识是否显式配置了等待策略
+	emptyMarker             string               // emptyMarker 是空值缓存占位内容
+	emptyTTL                time.Duration        // emptyTTL 是空值缓存默认过期时间
+	scanCount               int64                // scanCount 是清理前缀缓存时的 SCAN count，值越大网络往返越少但单轮 Redis 工作量越高
+	prefixDeleteConcurrency int                  // prefixDeleteConcurrency 是 DeleteByPrefix 同时扫描删除的 pattern 数，用于大 keyspace 下缩短清理耗时
+	lockRenew               time.Duration        // lockRenew 是缓存重建锁续期间隔，0 表示按 lockTTL 自动计算
+	resultTTL               time.Duration        // resultTTL 是重建完成元信息保留时间
+	prefixEpochTTL          time.Duration        // prefixEpochTTL 是前缀全量刷新代际元信息保留时间
+	prefixKeyIndex          bool                 // prefixKeyIndex 表示是否启用前缀 key 索引，用于大 keyspace 下优先绕开全库 SCAN
+	prefixKeyIndexTTL       time.Duration        // prefixKeyIndexTTL 是前缀 key 索引和可信标记的保留时间，过期后自动降级扫描
+	loaderTTL               time.Duration        // loaderTTL 是默认 Loader 超时时间，0 表示不额外设置超时
+	ctxPolicy               RebuildContextPolicy // ctxPolicy 是缓存重建上下文取消策略
+	concurrency             int                  // concurrency 是批量刷新并发度
+	logger                  Logger               // logger 是可选日志适配器
+	metrics                 Metrics              // metrics 是可选运行指标记录器
+	decoder                 Decoder              // decoder 是缓存读取反序列化函数
+	group                   singleflight.Group   // group 合并进程内相同 key 的并发刷新请求
 }
 
 // refreshOptions 表示一次刷新执行过程中的内部控制项。
@@ -116,20 +131,24 @@ func NewManager(store Store, targets []Target, opts ...Option) (*Manager, error)
 		return nil, errors.Errorf("tablecache store不能为空")
 	}
 	manager := &Manager{
-		store:          store,
-		targets:        make(map[string]Target, len(targets)),
-		ordered:        make([]Target, 0, len(targets)),
-		fixedKeys:      make(map[string]Target, len(targets)),
-		prefixTargets:  make([]Target, 0, len(targets)),
-		prefixTargetsM: make(map[string]Target, len(targets)),
-		lockTTL:        defaultLockTTL,
-		emptyMarker:    DefaultEmptyMarker,
-		emptyTTL:       defaultEmptyTTL,
-		scanCount:      defaultScanCount,
-		resultTTL:      defaultRebuildResultTTL,
-		prefixEpochTTL: defaultPrefixEpochTTL,
-		concurrency:    defaultRefreshConcurrency,
-		decoder:        json.Unmarshal,
+		store:                   store,
+		targets:                 make(map[string]Target, len(targets)),
+		ordered:                 make([]Target, 0, len(targets)),
+		fixedKeys:               make(map[string]Target, len(targets)),
+		prefixTargets:           make([]Target, 0, len(targets)),
+		prefixTargetsM:          make(map[string]Target, len(targets)),
+		keyPrefix:               defaultKeyPrefix,
+		lockTTL:                 defaultLockTTL,
+		emptyMarker:             DefaultEmptyMarker,
+		emptyTTL:                defaultEmptyTTL,
+		scanCount:               defaultScanCount,
+		prefixDeleteConcurrency: defaultPrefixDeleteConcurrency,
+		resultTTL:               defaultRebuildResultTTL,
+		prefixEpochTTL:          defaultPrefixEpochTTL,
+		prefixKeyIndex:          true,
+		prefixKeyIndexTTL:       defaultPrefixKeyIndexTTL,
+		concurrency:             defaultRefreshConcurrency,
+		decoder:                 json.Unmarshal,
 	}
 	for _, opt := range opts {
 		opt(manager)
@@ -139,11 +158,24 @@ func NewManager(store Store, targets []Target, opts ...Option) (*Manager, error)
 		if err != nil {
 			return nil, errors.Tag(err)
 		}
+		// 目标注册前统一转换成实际 Redis key 范围，后续匹配、删除和写回都基于同一命名空间判断。
+		normalized = manager.withKeyPrefixTarget(normalized)
+		if err := validateRedisClusterHashTagKey(normalized.Key); err != nil {
+			return nil, errors.Tag(err)
+		}
 		if err := manager.registerTarget(normalized); err != nil {
 			return nil, errors.Tag(err)
 		}
 	}
 	return manager, nil
+}
+
+// WithKeyPrefix 设置业务缓存 key 命名空间前缀，用于把 tablecache 管理的业务数据与其它 Redis key 隔离。
+// 默认前缀为 "tablecache:data:"；刷新、删除和写回只接受已带该前缀的实际 Redis key。
+func WithKeyPrefix(prefix string) Option {
+	return func(manager *Manager) {
+		manager.keyPrefix = strings.TrimSpace(prefix)
+	}
 }
 
 // WithLockTTL 设置缓存重建锁持有时间。
@@ -178,6 +210,24 @@ func WithPrefixEpochTTL(ttl time.Duration) Option {
 	return func(manager *Manager) {
 		if ttl > 0 {
 			manager.prefixEpochTTL = ttl
+		}
+	}
+}
+
+// WithPrefixKeyIndex 设置是否启用前缀 key 索引。
+// 启用后 Manager 会在前缀目标写入时维护索引，并在 DeleteByPrefix 时优先按索引删除；Store 不支持索引时自动降级。
+func WithPrefixKeyIndex(enabled bool) Option {
+	return func(manager *Manager) {
+		manager.prefixKeyIndex = enabled
+	}
+}
+
+// WithPrefixKeyIndexTTL 设置前缀 key 索引与可信标记的保留时间。
+// TTL 过短会让删除更容易降级到 SCAN；TTL 过长会保留更多可能已过期的成员，建议按业务缓存最长 TTL 配置。
+func WithPrefixKeyIndexTTL(ttl time.Duration) Option {
+	return func(manager *Manager) {
+		if ttl > 0 {
+			manager.prefixKeyIndexTTL = ttl
 		}
 	}
 }
@@ -244,6 +294,16 @@ func WithScanCount(count int64) Option {
 	}
 }
 
+// WithPrefixDeleteConcurrency 设置 DeleteByPrefix 同时扫描删除的 pattern 数。
+// 默认 1 表示保守串行；大 keyspace 且可接受更高 Redis 瞬时压力时可提高到 2~4 来缩短清理耗时。
+func WithPrefixDeleteConcurrency(concurrency int) Option {
+	return func(manager *Manager) {
+		if concurrency > 0 {
+			manager.prefixDeleteConcurrency = concurrency
+		}
+	}
+}
+
 // WithRefreshConcurrency 设置 RefreshAll 和 RefreshByKeys 的有限并发度。
 func WithRefreshConcurrency(concurrency int) Option {
 	return func(manager *Manager) {
@@ -287,7 +347,7 @@ func (m *Manager) Items() []Item {
 
 // IsFixedKey 判断 key 是否为固定内置缓存 key，模板和前缀型 key 不纳入固定 key。
 func (m *Manager) IsFixedKey(key string) bool {
-	key = strings.TrimSpace(key)
+	key = m.withKeyPrefix(key)
 	if key == "" {
 		return false
 	}
@@ -349,7 +409,7 @@ func (m *Manager) RefreshAllWithSummary(ctx context.Context) ([]RefreshBatchResu
 
 // RefreshByKey 根据 Redis key 刷新匹配的缓存目标。
 func (m *Manager) RefreshByKey(ctx context.Context, key string, fields ...string) error {
-	target, params, err := m.resolve(key, fields)
+	target, params, err := m.resolveForMutation(key, fields)
 	if err != nil {
 		return errors.Tag(err)
 	}
@@ -402,7 +462,7 @@ func (m *Manager) RefreshByKeysWithSummary(ctx context.Context, keys []string) (
 	m.recordRefreshBatch(ctx, "keys", summary)
 	m.logInfoEvent("refresh_batch_done", "", "", "result", refreshBatchResultLabel(summary), "total", summary.Total, "success", summary.Success, "failed", summary.Failed)
 	if summary.HasError() {
-		return results, summary, &RefreshBatchError{Summary: summary}
+		return results, summary, errors.Tag(&RefreshBatchError{Summary: summary})
 	}
 	return results, summary, nil
 }
@@ -418,7 +478,7 @@ func (m *Manager) Get(ctx context.Context, key string, dest any) (bool, error) {
 
 // GetState 从缓存读取指定 key，并返回命中、空值占位或未命中的明确状态。
 func (m *Manager) GetState(ctx context.Context, key string, dest any) (LookupResult, error) {
-	target, params, err := m.resolve(key, nil)
+	target, params, err := m.resolveForRead(key, nil)
 	if err != nil {
 		return LookupResult{}, errors.Tag(err)
 	}
@@ -489,7 +549,7 @@ func (m *Manager) LoadThroughBatchWithSummaryOptions(ctx context.Context, items 
 	results := m.LoadThroughBatchWithBatchOptions(ctx, items, options)
 	summary := SummarizeLoadThroughBatchResults(results)
 	if summary.HasError() {
-		return results, summary, &LoadThroughBatchError{Summary: summary}
+		return results, summary, errors.Tag(&LoadThroughBatchError{Summary: summary})
 	}
 	return results, summary, nil
 }
@@ -500,10 +560,13 @@ func (m *Manager) DeleteByKey(ctx context.Context, key string) error {
 	if key == "" {
 		return nil
 	}
-	if _, _, err := m.resolve(key, nil); err != nil {
+	target, params, err := m.resolveForMutation(key, nil)
+	if err != nil {
 		return errors.Tag(err)
 	}
-	return m.store.Delete(ctx, key, m.emptyKey(key), m.emptyCollectionKey(key), m.rebuildResultKey(key))
+	// params.Key 是 resolve 后的实际 Redis key，删除业务 key 与内部元信息必须使用同一个命名空间。
+	key = params.Key
+	return m.deleteTargetKeys(ctx, target, key, m.emptyKey(key), m.emptyCollectionKey(key), m.rebuildResultKey(key))
 }
 
 // DeleteByPrefix 删除指定 Redis key 前缀下的所有缓存。
@@ -512,31 +575,264 @@ func (m *Manager) DeleteByPrefix(ctx context.Context, prefix string) error {
 	if prefix == "" {
 		return nil
 	}
+	if err := m.requireKeyPrefix(prefix); err != nil {
+		return errors.Tag(err)
+	}
 	target, err := m.resolvePrefixTarget(prefix)
 	if err != nil {
 		return errors.Tag(err)
 	}
+	// indexCount/indexed/indexErr 表示索引快路径的删除结果；indexed=false 时说明索引未可信，应继续降级 SCAN。
+	indexCount, indexed, indexErr := m.deletePrefixByIndex(ctx, target)
+	if indexErr != nil {
+		return errors.Tag(indexErr)
+	}
+	if indexed {
+		m.recordPrefixDelete(ctx, target.Index, target.Key, indexCount)
+		return nil
+	}
+	// patterns 覆盖业务缓存 key 与 tablecache 内部元信息 key，避免前缀删除后残留空值或重建结果标记。
 	patterns := []string{
 		target.Key + "*",
-		m.emptyKey(target.Key) + "*",
-		m.emptyCollectionKey(target.Key) + "*",
-		m.rebuildResultKey(target.Key) + "*",
+		tablecacheMetaKeyPattern("empty", target.Key),
+		tablecacheMetaKeyPattern("empty_collection", target.Key),
+		tablecacheMetaKeyPattern("rebuild:result", target.Key),
 	}
-	var totalCount int64
-	for _, pattern := range patterns {
-		count, deleteErr := m.store.DeletePattern(ctx, pattern, m.scanCount)
-		if deleteErr != nil {
-			return deleteErr
-		}
-		totalCount += count
+	// totalCount 汇总所有 pattern 实际扫描删除的 key 数，用于指标观察大前缀清理规模。
+	totalCount, deleteErr := m.deletePrefixPatterns(ctx, patterns)
+	if deleteErr != nil {
+		return errors.Tag(deleteErr)
+	}
+	if err := m.clearPrefixIndex(ctx, target); err != nil {
+		return errors.Tag(err)
 	}
 	m.recordPrefixDelete(ctx, target.Index, target.Key, totalCount)
 	return nil
 }
 
+// deletePrefixPatterns 删除 DeleteByPrefix 需要覆盖的业务 key 与内部元信息 pattern。
+// 并发度为 1 时保持串行，降低 Redis 扫描压力；并发度大于 1 时用于缩短大 keyspace 下多类元信息清理耗时。
+func (m *Manager) deletePrefixPatterns(ctx context.Context, patterns []string) (int64, error) {
+	// concurrency 来自 Manager 配置，表示允许同时推进的 pattern 数；非法值会被收敛到默认保守值。
+	concurrency := m.prefixDeleteConcurrencyValue()
+	if concurrency <= 1 || len(patterns) <= 1 {
+		// totalCount 是串行删除累计值，出现错误时连同已完成数量一起返回，便于调用方日志排障。
+		var totalCount int64
+		for _, pattern := range patterns {
+			// 串行分支用于默认线上策略：每次只让一个 pattern 推进 SCAN，避免清理操作争抢 Redis 主线程。
+			count, err := m.store.DeletePattern(ctx, pattern, m.scanCount)
+			if err != nil {
+				return totalCount, errors.Wrapf(err, "删除前缀缓存pattern[%s]失败", pattern)
+			}
+			totalCount += count
+		}
+		return totalCount, nil
+	}
+	// totalCount 使用原子计数聚合多 goroutine 删除结果，避免并发 pattern 完成顺序不确定造成数据竞争。
+	var totalCount atomic.Int64
+	// groupCtx 会在任一 pattern 删除失败时取消其它扫描任务，避免故障场景继续施压 Redis。
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.SetLimit(concurrency)
+	for _, pattern := range patterns {
+		// pattern 是当前 goroutine 独立持有的删除表达式，避免闭包捕获循环变量导致误删或漏删。
+		pattern := pattern
+		group.Go(func() error {
+			// 并发分支只并发不同 pattern，每个 pattern 内部仍由 Store 决定如何安全推进 Redis SCAN。
+			count, err := m.store.DeletePattern(groupCtx, pattern, m.scanCount)
+			if err != nil {
+				return errors.Wrapf(err, "删除前缀缓存pattern[%s]失败", pattern)
+			}
+			totalCount.Add(count)
+			return nil
+		})
+	}
+	if err := group.Wait(); err != nil {
+		return totalCount.Load(), errors.Tag(err)
+	}
+	return totalCount.Load(), nil
+}
+
+// prefixDeleteConcurrencyValue 返回 DeleteByPrefix 的安全并发度，避免非法配置导致 errgroup SetLimit panic。
+func (m *Manager) prefixDeleteConcurrencyValue() int {
+	if m.prefixDeleteConcurrency <= 0 {
+		return defaultPrefixDeleteConcurrency
+	}
+	return m.prefixDeleteConcurrency
+}
+
+// deletePrefixByIndex 在索引可信时按前缀 key 索引删除，避免 Redis keyspace 特别大时执行全库 SCAN。
+func (m *Manager) deletePrefixByIndex(ctx context.Context, target Target) (int64, bool, error) {
+	store, ok := m.prefixIndexStore() // store 是当前底层 Store 的索引能力，缺失时表示必须走 SCAN 降级路径
+	if !ok || !m.isPrefixTarget(target) {
+		return 0, false, nil
+	}
+	readyKey := m.prefixIndexReadyKey(target) // readyKey 表示该前缀索引已覆盖一次完整全量刷新，可作为 DeleteByPrefix 快路径依据
+	indexKey := m.prefixIndexKey(target)      // indexKey 表示该前缀目标维护的真实 key 成员集合
+	existsMap, err := m.existsMulti(ctx, readyKey, indexKey)
+	if err != nil {
+		return 0, false, errors.Tag(err)
+	}
+	if !existsMap[readyKey] {
+		return 0, false, nil
+	}
+	if !existsMap[indexKey] {
+		if err := m.store.Delete(ctx, readyKey); err != nil {
+			return 0, false, errors.Tag(err)
+		}
+		return 0, false, nil
+	}
+	count, err := store.DeletePrefixIndexKeys(ctx, indexKey, m.scanCount) // count 表示索引集合中被尝试删除的成员数量
+	if err != nil {
+		return count, true, errors.Wrapf(err, "按前缀索引删除缓存失败 index=%s", target.Index)
+	}
+	if err := m.store.Delete(ctx, readyKey, indexKey); err != nil {
+		return count, true, errors.Tag(err)
+	}
+	return count, true, nil
+}
+
+// deleteTargetKeys 删除某个目标关联的真实 Redis key，并同步从前缀索引移除成员，避免索引长期堆积陈旧 key。
+func (m *Manager) deleteTargetKeys(ctx context.Context, target Target, keys ...string) error {
+	cleanKeys := cleanRedisKeys(keys) // cleanKeys 表示本次实际需要删除并从索引移除的业务或元信息 key
+	if len(cleanKeys) == 0 {
+		return nil
+	}
+	mutation := StoreMutation{
+		DeleteKeys: cleanKeys,
+	}
+	if indexMutation, ok := m.prefixIndexMutation(target, cleanKeys, 0); ok {
+		mutation.RemoveIndex = append(mutation.RemoveIndex, indexMutation)
+	}
+	return m.applyStoreMutation(ctx, mutation)
+}
+
+// indexPrefixKeys 把前缀目标写入成功的业务 key 或元信息 key 记录到索引集合。
+// 固定目标和不支持索引的 Store 会直接跳过，作为低风险降级策略。
+func (m *Manager) indexPrefixKeys(ctx context.Context, target Target, keys ...string) error {
+	indexMutation, ok := m.prefixIndexMutation(target, keys, m.prefixKeyIndexTTL)
+	if !ok {
+		return nil
+	}
+	return m.applyStoreMutation(ctx, StoreMutation{AddIndex: []PrefixIndexMutation{indexMutation}})
+}
+
+// removePrefixIndexKeys 从前缀索引移除已删除或已失效的 key，降低后续按索引删除时的无效成员数量。
+func (m *Manager) removePrefixIndexKeys(ctx context.Context, target Target, keys ...string) error {
+	indexMutation, ok := m.prefixIndexMutation(target, keys, 0)
+	if !ok {
+		return nil
+	}
+	return m.applyStoreMutation(ctx, StoreMutation{RemoveIndex: []PrefixIndexMutation{indexMutation}})
+}
+
+// applyStoreMutation 优先使用 Store 合并变更快路径；Store 不支持时拆分为基础删除、写入和索引维护调用。
+func (m *Manager) applyStoreMutation(ctx context.Context, mutation StoreMutation) error {
+	if store, ok := m.store.(MutationStore); ok {
+		return errors.Tag(store.ApplyMutation(ctx, mutation))
+	}
+	deleteKeys := cleanRedisKeys(mutation.DeleteKeys) // deleteKeys 表示降级路径需要删除的真实 Redis key
+	if len(deleteKeys) > 0 {
+		if err := m.store.Delete(ctx, deleteKeys...); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	for _, indexMutation := range cleanPrefixIndexMutations(mutation.RemoveIndex) {
+		store, ok := m.prefixIndexStore()
+		if !ok {
+			continue
+		}
+		if err := store.RemovePrefixIndexKeys(ctx, indexMutation.IndexKey, indexMutation.Keys...); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	writeEntries := cleanMutationEntries(mutation.WriteEntries) // writeEntries 表示降级路径需要写入的缓存条目
+	if len(writeEntries) > 0 {
+		if err := m.store.WriteBatch(ctx, writeEntries); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	for _, indexMutation := range cleanPrefixIndexMutations(mutation.AddIndex) {
+		store, ok := m.prefixIndexStore()
+		if !ok {
+			continue
+		}
+		if err := store.AddPrefixIndexKeys(ctx, indexMutation.IndexKey, indexMutation.TTL, indexMutation.Keys...); err != nil {
+			return errors.Tag(err)
+		}
+	}
+	return nil
+}
+
+// prefixIndexMutation 构造当前目标的索引成员变更；索引关闭、固定目标或空成员时返回 false。
+func (m *Manager) prefixIndexMutation(target Target, keys []string, ttl time.Duration) (PrefixIndexMutation, bool) {
+	if !m.prefixKeyIndex || !m.isPrefixTarget(target) {
+		return PrefixIndexMutation{}, false
+	}
+	cleanKeys := cleanRedisKeys(keys) // cleanKeys 表示需要写入或移除索引集合的真实 Redis key 成员
+	if len(cleanKeys) == 0 {
+		return PrefixIndexMutation{}, false
+	}
+	return PrefixIndexMutation{
+		IndexKey: m.prefixIndexKey(target),
+		TTL:      ttl,
+		Keys:     cleanKeys,
+	}, true
+}
+
+// clearPrefixIndex 清理前缀索引集合与可信标记，用于 SCAN 降级删除成功后重置索引状态。
+func (m *Manager) clearPrefixIndex(ctx context.Context, target Target) error {
+	if !m.prefixKeyIndex || !m.isPrefixTarget(target) {
+		return nil
+	}
+	if _, ok := m.prefixIndexStore(); !ok {
+		return nil
+	}
+	return m.store.Delete(ctx, m.prefixIndexKey(target), m.prefixIndexReadyKey(target))
+}
+
+// markPrefixIndexReady 在前缀全量刷新成功后写入可信标记，后续 DeleteByPrefix 才能安全使用索引快路径。
+func (m *Manager) markPrefixIndexReady(ctx context.Context, target Target, key string) error {
+	if !m.prefixKeyIndex || !m.isPrefixTarget(target) || key != target.Key {
+		return nil
+	}
+	if _, ok := m.prefixIndexStore(); !ok {
+		return nil
+	}
+	return m.store.Write(ctx, Entry{
+		Key:   m.prefixIndexReadyKey(target),
+		Type:  TypeString,
+		Value: time.Now().Format(time.RFC3339Nano),
+		TTL:   m.prefixKeyIndexTTL,
+	})
+}
+
+// prefixIndexStore 返回当前 Store 的前缀索引能力；未实现时 Manager 自动回退到 SCAN。
+func (m *Manager) prefixIndexStore() (PrefixIndexStore, bool) {
+	if !m.prefixKeyIndex || m.store == nil {
+		return nil, false
+	}
+	store, ok := m.store.(PrefixIndexStore) // store 是可选索引接口实现；ok=false 时保持历史 SCAN 行为
+	return store, ok
+}
+
+// isPrefixTarget 判断目标是否为前缀型缓存目标；只有前缀目标才需要维护 key 索引。
+func (m *Manager) isPrefixTarget(target Target) bool {
+	return strings.HasSuffix(target.Key, ":")
+}
+
+// prefixIndexKey 返回前缀目标的 key 索引集合名，集合成员为该目标管理的业务 key 与内部元信息 key。
+func (m *Manager) prefixIndexKey(target Target) string {
+	return tablecacheMetaKey("index:keys", target.Key)
+}
+
+// prefixIndexReadyKey 返回前缀索引可信标记 key；只有完成一次全量刷新后该标记才会存在。
+func (m *Manager) prefixIndexReadyKey(target Target) string {
+	return tablecacheMetaKey("index:ready", target.Key)
+}
+
 // getOrRefresh 统一封装读取、按需回源、回填和返回结果的完整链路。
 func (m *Manager) getOrRefresh(ctx context.Context, key string, dest any, options LoadThroughOptions) (LookupResult, error) {
-	target, params, err := m.resolve(key, options.Fields)
+	target, params, err := m.resolveForRead(key, options.Fields)
 	if err != nil {
 		return LookupResult{}, errors.Tag(err)
 	}
@@ -545,6 +841,9 @@ func (m *Manager) getOrRefresh(ctx context.Context, key string, dest any, option
 		return LookupResult{}, errors.Tag(err)
 	}
 	if result.State != LookupStateMiss {
+		return result, nil
+	}
+	if err := m.requireKeyPrefix(key); err != nil {
 		return result, nil
 	}
 	target = m.mergeLoadThroughTarget(target, options)
@@ -707,15 +1006,39 @@ func (m *Manager) executeRefreshWithLock(ctx context.Context, refreshCtx context
 	defer cancelCause(nil)
 	stopRenew := m.startLockRenew(rebuildCtx, lockKey, lockValue, cancelCause)
 	defer m.releaseRefreshLock(ctx, lockKey, lockValue, stopRenew)
-	prefixEpoch, entries, wroteHiddenEmptyMarker, err := m.loadRefreshEntries(ctx, rebuildCtx, target, key, fields, options)
+	if err := m.ensureRefreshLockOwned(rebuildCtx, lockKey, lockValue); err != nil {
+		return errors.Tag(err)
+	}
+	if err := m.clearRefreshResults(rebuildCtx, target, key, fieldsReadyName); err != nil {
+		return errors.Tag(err)
+	}
+	prefixEpoch, entries, wroteHiddenEmptyMarker, err := m.loadRefreshEntries(ctx, rebuildCtx, target, key, fields, options, lockKey, lockValue)
 	if err != nil {
+		return errors.Tag(err)
+	}
+	if err := m.ensureRefreshLockOwned(rebuildCtx, lockKey, lockValue); err != nil {
 		return errors.Tag(err)
 	}
 	if err := m.writeRefreshEntries(ctx, rebuildCtx, target, key, prefixEpoch, entries); err != nil {
 		return errors.Tag(err)
 	}
-	if err := m.finalizeRefreshState(ctx, rebuildCtx, target, key, prefixEpoch, entries, wroteHiddenEmptyMarker, options, fieldsReadyName); err != nil {
+	if err := m.ensureRefreshLockOwned(rebuildCtx, lockKey, lockValue); err != nil {
 		return errors.Tag(err)
+	}
+	if err := m.finalizeRefreshState(ctx, rebuildCtx, target, key, prefixEpoch, entries, wroteHiddenEmptyMarker, options, fieldsReadyName, lockValue); err != nil {
+		return errors.Tag(err)
+	}
+	return nil
+}
+
+// ensureRefreshLockOwned 在关键写入前复核当前实例仍持有刷新锁，避免锁过期后旧 owner 继续写入脏缓存。
+func (m *Manager) ensureRefreshLockOwned(ctx context.Context, lockKey string, lockValue string) error {
+	ok, err := m.store.RefreshLock(ctx, lockKey, lockValue, m.lockTTL)
+	if err != nil {
+		return errors.Wrapf(errors.Join(ErrRefreshLockLost, err), "缓存锁[%s]owner复核失败", lockKey)
+	}
+	if !ok {
+		return errors.Wrapf(ErrRefreshLockLost, "缓存锁[%s]owner复核失败: owner_mismatch", lockKey)
 	}
 	return nil
 }
@@ -729,7 +1052,7 @@ func (m *Manager) releaseRefreshLock(ctx context.Context, lockKey string, lockVa
 }
 
 // loadRefreshEntries 执行回源、空值占位决策与前缀刷新前置清理。
-func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Context, target Target, key string, fields []string, options refreshOptions) (string, []Entry, bool, error) {
+func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Context, target Target, key string, fields []string, options refreshOptions, lockKey string, lockValue string) (string, []Entry, bool, error) {
 	prefixEpoch, err := m.preparePrefixRefreshEpoch(rebuildCtx, target, key)
 	if err != nil {
 		return "", nil, false, errors.Tag(err)
@@ -754,6 +1077,9 @@ func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Con
 		if target.VisibleEmptyMark {
 			entries = []Entry{m.emptyEntry(target, key)}
 		} else {
+			if err := m.ensureRefreshLockOwned(rebuildCtx, lockKey, lockValue); err != nil {
+				return "", nil, false, errors.Tag(err)
+			}
 			if err := m.writeHiddenEmptyMarker(rebuildCtx, target, key); err != nil {
 				return "", nil, false, errors.Tag(err)
 			}
@@ -763,6 +1089,9 @@ func (m *Manager) loadRefreshEntries(ctx context.Context, rebuildCtx context.Con
 	}
 	if strings.HasSuffix(target.Key, ":") && key == target.Key {
 		// 前缀目标做全量刷新时先清理旧 key，避免删除源数据中已不存在的脏缓存。
+		if err := m.ensureRefreshLockOwned(rebuildCtx, lockKey, lockValue); err != nil {
+			return "", nil, false, errors.Tag(err)
+		}
 		if err := m.DeleteByPrefix(rebuildCtx, target.Key); err != nil {
 			return "", nil, false, errors.Tag(err)
 		}
@@ -784,8 +1113,8 @@ func (m *Manager) writeRefreshEntries(ctx context.Context, rebuildCtx context.Co
 	if len(entries) == 0 {
 		return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
 	}
-	normalEntries := make([]Entry, 0, len(entries))
-	emptyCollectionEntries := make([]Entry, 0)
+	normalEntries := make([]Entry, 0, len(entries))          // normalEntries 表示需要真实写入业务 key 的缓存条目
+	emptyCollectionEntries := make([]Entry, 0, len(entries)) // emptyCollectionEntries 表示真实空集合条目，只写元信息避免 Redis 无法保存空集合
 	for _, entry := range entries {
 		if isEmptyCollectionEntry(entry) {
 			emptyCollectionEntries = append(emptyCollectionEntries, entry)
@@ -793,39 +1122,45 @@ func (m *Manager) writeRefreshEntries(ctx context.Context, rebuildCtx context.Co
 			normalEntries = append(normalEntries, entry)
 		}
 	}
-	cleanupKeys := make([]string, 0, len(entries)*2)
+	cleanupKeys := make([]string, 0, len(entries)*2) // cleanupKeys 表示本次写入前需要清理的旧空值或旧业务 key，清理后也要同步移除索引成员
 	for _, entry := range normalEntries {
 		cleanupKeys = append(cleanupKeys, m.emptyKey(entry.Key), m.emptyCollectionKey(entry.Key))
 	}
 	for _, entry := range emptyCollectionEntries {
 		cleanupKeys = append(cleanupKeys, entry.Key, m.emptyKey(entry.Key))
 	}
-	if len(cleanupKeys) > 0 {
-		if err := m.store.Delete(rebuildCtx, cleanupKeys...); err != nil {
-			return errors.Tag(err)
-		}
+	markerEntries := m.emptyCollectionMarkerEntries(emptyCollectionEntries) // markerEntries 表示真实空集合对应的内部元信息写入项
+	writeEntries := make([]Entry, 0, len(normalEntries)+len(markerEntries)) // writeEntries 表示本次可合并提交的全部写入条目
+	writeEntries = append(writeEntries, normalEntries...)
+	writeEntries = append(writeEntries, markerEntries...)
+	addIndexKeys := make([]string, 0, len(writeEntries)) // addIndexKeys 表示写入成功后需要纳入前缀索引的 key
+	for _, entry := range writeEntries {
+		addIndexKeys = append(addIndexKeys, entry.Key)
 	}
-	if len(normalEntries) > 0 {
-		if err := m.store.WriteBatch(rebuildCtx, normalEntries); err != nil {
-			return errors.Tag(err)
-		}
+	mutation := StoreMutation{
+		DeleteKeys:   cleanupKeys,
+		WriteEntries: writeEntries,
 	}
-	if len(emptyCollectionEntries) > 0 {
-		if err := m.writeEmptyCollectionMarkers(rebuildCtx, emptyCollectionEntries); err != nil {
-			return errors.Tag(err)
-		}
+	if indexMutation, ok := m.prefixIndexMutation(target, cleanupKeys, 0); ok {
+		mutation.RemoveIndex = append(mutation.RemoveIndex, indexMutation)
+	}
+	if indexMutation, ok := m.prefixIndexMutation(target, addIndexKeys, m.prefixKeyIndexTTL); ok {
+		mutation.AddIndex = append(mutation.AddIndex, indexMutation)
+	}
+	if err := m.applyStoreMutation(rebuildCtx, mutation); err != nil {
+		return errors.Tag(err)
 	}
 	m.recordRefreshEntryCount(ctx, target.Index, len(entries))
 	return m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch)
 }
 
 // finalizeRefreshState 处理空结果收尾、结果元信息写入和补充指标记录。
-func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry, wroteHiddenEmptyMarker bool, options refreshOptions, fieldsReadyName string) error {
+func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.Context, target Target, key string, prefixEpoch string, entries []Entry, wroteHiddenEmptyMarker bool, options refreshOptions, fieldsReadyName string, lockValue string) error {
 	if len(entries) == 0 && wroteHiddenEmptyMarker {
 		if err := m.deleteBusinessKey(rebuildCtx, target, key); err != nil {
 			return errors.Tag(err)
 		}
-		if err := m.store.Delete(rebuildCtx, m.emptyCollectionKey(key)); err != nil {
+		if err := m.deleteTargetKeys(rebuildCtx, target, m.emptyCollectionKey(key)); err != nil {
 			return errors.Tag(err)
 		}
 	}
@@ -837,7 +1172,10 @@ func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.C
 	if err := m.ensureRefreshWritable(rebuildCtx, target, key, prefixEpoch); err != nil {
 		return errors.Tag(err)
 	}
-	m.markRefreshResults(ctx, key, fieldsReadyName)
+	m.markRefreshResults(ctx, target, key, fieldsReadyName, lockValue)
+	if err := m.markPrefixIndexReady(rebuildCtx, target, key); err != nil {
+		return errors.Tag(err)
+	}
 	if len(entries) == 1 && target.AllowEmptyMarker && options.requested && target.VisibleEmptyMark {
 		m.recordEmptyMarkerWrite(ctx, target.Index)
 	}
@@ -847,20 +1185,30 @@ func (m *Manager) finalizeRefreshState(ctx context.Context, rebuildCtx context.C
 	return nil
 }
 
-// markRefreshResults 写入 key 级与 fields 级重建完成元信息，供等待方快速判定完成。
-func (m *Manager) markRefreshResults(ctx context.Context, key string, fieldsReadyName string) {
-	m.markRefreshResult(ctx, key)
+// markRefreshResults 写入本次刷新对应的重建完成元信息，供等待方快速判定完成。
+func (m *Manager) markRefreshResults(ctx context.Context, target Target, key string, fieldsReadyName string, lockValue string) {
 	if fieldsReadyName != "" {
-		// fields 场景额外写入 fields 专属 result marker，避免等待方因只看 key 存在而误判完成。
-		m.markRefreshResult(ctx, fieldsReadyName)
+		// fields 场景只写 fields 专属 marker，避免不同 fields 刷新共享 key 级 marker 后互相误判完成。
+		m.markRefreshResult(ctx, target, fieldsReadyName, lockValue)
+		return
 	}
+	m.markRefreshResult(ctx, target, key, lockValue)
+}
+
+// clearRefreshResults 清除本次刷新对应的旧完成标记，避免等待方把上一轮短 TTL marker 当成本轮成功。
+func (m *Manager) clearRefreshResults(ctx context.Context, target Target, key string, fieldsReadyName string) error {
+	resultName := key
+	if fieldsReadyName != "" {
+		resultName = fieldsReadyName
+	}
+	return m.deleteTargetKeys(ctx, target, m.rebuildResultKey(resultName))
 }
 
 // markRefreshResult 封装一次短超时的重建结果元信息写入，并统一处理日志。
-func (m *Manager) markRefreshResult(ctx context.Context, key string) {
+func (m *Manager) markRefreshResult(ctx context.Context, target Target, key string, lockValue string) {
 	resultCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
 	defer cancel()
-	if err := m.markRebuildResult(resultCtx, key); err != nil && m.logger != nil {
+	if err := m.markRebuildResult(resultCtx, target, key, lockValue); err != nil && m.logger != nil {
 		m.logger.Warnf("tablecache写入重建结果元信息失败 key=%s err=%v", key, err)
 	}
 }
@@ -884,58 +1232,82 @@ func (m *Manager) existsMulti(ctx context.Context, keys ...string) (map[string]b
 // waitRebuilt 等待其它实例完成缓存重建。
 func (m *Manager) waitRebuilt(ctx context.Context, target Target, key string, lockName string, waitName string) (waitRebuildOutcome, error) {
 	_, waitTimes := m.waitPolicy(target)
-	emptyKey := m.emptyKey(key)
 	resultKey := m.rebuildResultKey(waitName)
-	baseResultKey := m.rebuildResultKey(key)
 	lockKey := m.lockKey(lockName)
-	fieldsRefresh := waitName != key
 	for i := 0; i < waitTimes; i++ {
 		if err := waitWithContext(ctx, m.waitDelay(target, i)); err != nil {
 			return 0, errors.Tag(err)
 		}
-		existsKeys := []string{emptyKey, resultKey, lockKey}
-		// fieldsRefresh 表示本次等待属于 fields 级刷新；此时不依赖业务 key 是否存在来判定完成，
-		// 而是依赖 result marker 或 empty marker，避免“局部刷新”场景误判就绪。
-		if !fieldsRefresh {
-			existsKeys = append([]string{key}, existsKeys...)
-		} else {
-			existsKeys = append(existsKeys, baseResultKey)
-		}
-		existsMap, err := m.existsMulti(ctx, existsKeys...)
+		lockValue, locked, err := m.readStringValue(ctx, lockKey)
 		if err != nil {
 			return 0, errors.Tag(err)
 		}
-		// fieldsRefresh 场景除 fields 专属 result 以外，也接受 baseResultKey，
-		// 用于兼容“已有其它实例完成过完整重建”的情形，避免不必要的重复回源。
-		if (!fieldsRefresh && existsMap[key]) || existsMap[emptyKey] || existsMap[resultKey] || (fieldsRefresh && existsMap[baseResultKey]) {
-			return waitRebuildReady, nil
-		}
-		if !existsMap[lockKey] {
-			existsKeys := []string{emptyKey, resultKey}
-			if !fieldsRefresh {
-				existsKeys = append([]string{key}, existsKeys...)
-			} else {
-				existsKeys = append(existsKeys, baseResultKey)
-			}
-			existsMap, err := m.existsMulti(ctx, existsKeys...)
+		if locked {
+			resultValue, resultReady, err := m.readStringValue(ctx, resultKey)
 			if err != nil {
 				return 0, errors.Tag(err)
 			}
-			if (!fieldsRefresh && existsMap[key]) || existsMap[emptyKey] || existsMap[resultKey] || (fieldsRefresh && existsMap[baseResultKey]) {
+			// 锁仍存在时必须校验 result marker 来源于当前锁 owner，避免上一轮短 TTL marker 被误判成本轮完成。
+			if resultReady && resultValue == lockValue {
 				return waitRebuildReady, nil
 			}
-			return waitRebuildRetry, nil
+			continue
 		}
+		_, resultReady, err := m.readStringValue(ctx, resultKey)
+		if err != nil {
+			return 0, errors.Tag(err)
+		}
+		// 锁已释放时保留历史兼容语义：只要当前 result marker 存在，就认为持锁方已完成写回。
+		if resultReady {
+			return waitRebuildReady, nil
+		}
+		return waitRebuildRetry, nil
 	}
 	m.recordWaitTimeout(ctx, target.Index)
 	return 0, errors.Wrapf(ErrWaitRebuildTimeout, "缓存key[%s]等待重建超时", key)
 }
 
-// resolve 根据 Redis key 找到对应缓存目标和加载参数。
-func (m *Manager) resolve(key string, fields []string) (Target, LoadParams, error) {
+// readStringValue 读取 String 类型内部元信息，返回值、存在状态和错误，供锁等待逻辑做 owner 级判定。
+func (m *Manager) readStringValue(ctx context.Context, key string) (string, bool, error) {
+	value, err := m.store.Read(ctx, key, TypeString)
+	if errors.Is(err, ErrCacheMiss) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, errors.Tag(err)
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", false, errors.Errorf("缓存key[%s]不是String类型元信息", key)
+	}
+	return text, true, nil
+}
+
+// resolveForRead 根据 Redis key 找到对应缓存目标和加载参数。
+// 读取路径允许传逻辑 key；Manager 会映射到带前缀的实际 Redis key，只查询新命名空间数据。
+func (m *Manager) resolveForRead(key string, fields []string) (Target, LoadParams, error) {
+	key = m.withKeyPrefix(key)
+	return m.resolvePhysical(key, fields)
+}
+
+// resolveForMutation 根据 Redis key 找到对应缓存目标和加载参数。
+// 刷新、删除和写回属于有副作用操作，必须由调用方显式传入已带指定前缀的实际 Redis key。
+func (m *Manager) resolveForMutation(key string, fields []string) (Target, LoadParams, error) {
+	key = strings.TrimSpace(key)
+	if err := m.requireKeyPrefix(key); err != nil {
+		return Target{}, LoadParams{}, err
+	}
+	return m.resolvePhysical(key, fields)
+}
+
+// resolvePhysical 根据实际 Redis key 找到对应缓存目标和加载参数。
+func (m *Manager) resolvePhysical(key string, fields []string) (Target, LoadParams, error) {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return Target{}, LoadParams{}, ErrTargetNotFound
+	}
+	if err := validateRedisClusterHashTagKey(key); err != nil {
+		return Target{}, LoadParams{}, err
 	}
 	if target, ok := m.fixedKeys[key]; ok {
 		params := m.loadParams(target, key, fields)
@@ -985,6 +1357,38 @@ func (m *Manager) loadParams(target Target, key string, fields []string) LoadPar
 		KeyParts: parts,
 		Fields:   cleanFields,
 	}
+}
+
+// withKeyPrefix 把读取路径传入的逻辑 key 转换成实际 Redis key。
+// 已带命名空间前缀的 key 会原样返回；写入、刷新和删除路径不会调用该方法做兼容补全。
+func (m *Manager) withKeyPrefix(key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" || m.keyPrefix == "" || strings.HasPrefix(key, m.keyPrefix) {
+		return key
+	}
+	return m.keyPrefix + key
+}
+
+// requireKeyPrefix 校验有副作用操作只能处理已带指定命名空间前缀的实际 Redis key。
+func (m *Manager) requireKeyPrefix(key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ErrTargetNotFound
+	}
+	if m.keyPrefix == "" || strings.HasPrefix(key, m.keyPrefix) {
+		return nil
+	}
+	return errors.Wrapf(ErrKeyPrefixRequired, "缓存key[%s]缺少指定前缀[%s]", key, m.keyPrefix)
+}
+
+// withKeyPrefixTarget 把缓存目标声明转换成实际 Redis key 范围。
+// Target.Key 是后续匹配、删除和集群 hash tag 的数据来源，因此注册阶段统一加前缀，避免每条路径重复判断。
+func (m *Manager) withKeyPrefixTarget(target Target) Target {
+	target.Key = m.withKeyPrefix(target.Key)
+	if target.KeyTitle != "" {
+		target.KeyTitle = m.withKeyPrefix(target.KeyTitle)
+	}
+	return target
 }
 
 // refreshReadyName 返回本次刷新用于“就绪判定”的标识名。
@@ -1058,7 +1462,7 @@ func (m *Manager) isEmptyValue(typ CacheType, value any) bool {
 	switch typ {
 	case TypeHash:
 		if data, ok := value.(map[string]string); ok {
-			return data[hashEmptyMarkerField] == m.emptyMarker || data["value"] == m.emptyMarker
+			return len(data) == 1 && data[hashEmptyMarkerField] == m.emptyMarker
 		}
 	case TypeList, TypeSet:
 		if data, ok := value.([]string); ok {
@@ -1074,6 +1478,11 @@ func (m *Manager) isEmptyValue(typ CacheType, value any) bool {
 		}
 	}
 	return false
+}
+
+// shouldTreatValueAsVisibleEmptyMarker 判断业务 key 内的可见空值占位是否对当前目标生效。
+func (m *Manager) shouldTreatValueAsVisibleEmptyMarker(target Target, value any) bool {
+	return target.AllowEmptyMarker && target.VisibleEmptyMark && m.isEmptyValue(target.Type, value)
 }
 
 // decodeValue 把缓存原始值写入调用方传入的目标对象。
@@ -1131,7 +1540,7 @@ func (m *Manager) lookup(ctx context.Context, target Target, params LoadParams, 
 		}
 		return LookupResult{}, errors.Tag(err)
 	}
-	if m.isEmptyValue(target.Type, value) {
+	if m.shouldTreatValueAsVisibleEmptyMarker(target, value) {
 		m.recordCacheMiss(ctx, target.Index)
 		m.recordLookupState(ctx, target.Index, LookupStateEmpty)
 		return LookupResult{State: LookupStateEmpty}, nil
@@ -1163,6 +1572,9 @@ func (m *Manager) validateRefreshEntryScope(target Target, entry Entry) error {
 	entryKey := strings.TrimSpace(entry.Key)
 	if entryKey == "" {
 		return errors.Errorf("Redis缓存key不能为空")
+	}
+	if err := validateRedisClusterHashTagKey(entryKey); err != nil {
+		return errors.Tag(err)
 	}
 	if strings.HasSuffix(target.Key, ":") {
 		if strings.HasPrefix(entryKey, target.Key) {
@@ -1217,9 +1629,9 @@ func emptyCollectionValue(typ CacheType) any {
 	}
 }
 
-// writeEmptyCollectionMarkers 写入真实空集合元信息，避免空集合被误判为缓存 miss。
-func (m *Manager) writeEmptyCollectionMarkers(ctx context.Context, entries []Entry) error {
-	markerEntries := make([]Entry, 0, len(entries))
+// emptyCollectionMarkerEntries 构造真实空集合元信息写入项，避免空集合被误判为缓存 miss。
+func (m *Manager) emptyCollectionMarkerEntries(entries []Entry) []Entry {
+	markerEntries := make([]Entry, 0, len(entries)) // markerEntries 表示需要写入 Redis 的空集合占位元信息条目
 	for _, entry := range entries {
 		markerEntries = append(markerEntries, Entry{
 			Key:    m.emptyCollectionKey(entry.Key),
@@ -1229,7 +1641,7 @@ func (m *Manager) writeEmptyCollectionMarkers(ctx context.Context, entries []Ent
 			Jitter: entry.Jitter,
 		})
 	}
-	return m.store.WriteBatch(ctx, markerEntries)
+	return markerEntries
 }
 
 // startLockRenew 在加载器运行期间定时续期当前实例持有的锁。
@@ -1368,7 +1780,7 @@ func (m *Manager) prefixEpochKey(prefix string) string {
 	if prefix == "" {
 		prefix = "unknown"
 	}
-	return "tablecache:rebuild:epoch:" + prefix
+	return tablecacheMetaKey("rebuild:epoch", prefix)
 }
 
 // readPrefixRefreshEpoch 读取当前前缀全量刷新代际；未命中时返回空字符串。
@@ -1410,7 +1822,7 @@ func (m *Manager) lockKey(key string) string {
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:rebuild:lock:" + key
+	return tablecacheMetaKey("rebuild:lock", key)
 }
 
 // rebuildResultKey 返回缓存重建完成元信息 key。
@@ -1419,7 +1831,7 @@ func (m *Manager) rebuildResultKey(key string) string {
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:rebuild:result:" + key
+	return tablecacheMetaKey("rebuild:result", key)
 }
 
 // emptyKey 返回隐藏空值占位元信息 key。
@@ -1428,7 +1840,7 @@ func (m *Manager) emptyKey(key string) string {
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:empty:" + key
+	return tablecacheMetaKey("empty", key)
 }
 
 // emptyCollectionKey 返回真实空集合元信息 key。
@@ -1437,7 +1849,59 @@ func (m *Manager) emptyCollectionKey(key string) string {
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:empty_collection:" + key
+	return tablecacheMetaKey("empty_collection", key)
+}
+
+// tablecacheMetaKey 生成内部元信息 key，并附带 Redis Cluster hash tag。
+// 业务 key 自带合法 {...} tag 时沿用该 tag；否则使用完整业务 key，确保常规 key 的元信息可与业务 key 同槽。
+func tablecacheMetaKey(kind string, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		key = "unknown"
+	}
+	return "tablecache:" + kind + ":" + key + ":{" + redisClusterHashTag(key) + "}"
+}
+
+// tablecacheMetaKeyPattern 返回前缀清理元信息时使用的 pattern；hash tag 位于 key 后缀，因此这里按 key 前缀匹配。
+func tablecacheMetaKeyPattern(kind string, prefix string) string {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" {
+		prefix = "unknown"
+	}
+	return "tablecache:" + kind + ":" + prefix + "*"
+}
+
+// redisClusterHashTag 返回 Redis Cluster 对 key 实际使用的 hash tag；无显式 tag 时使用完整 key。
+func redisClusterHashTag(key string) string {
+	start := strings.IndexByte(key, '{')
+	if start < 0 {
+		return key
+	}
+	end := strings.IndexByte(key[start+1:], '}')
+	if end <= 0 {
+		return key
+	}
+	return key[start+1 : start+1+end]
+}
+
+// validateRedisClusterHashTagKey 拒绝无法让 tablecache 元信息 key 与业务 key 保持同槽的异常花括号形式。
+func validateRedisClusterHashTagKey(key string) error {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil
+	}
+	start := strings.IndexByte(key, '{')
+	if start < 0 {
+		if strings.Contains(key, "}") {
+			return errors.Wrapf(ErrInvalidClusterHashTag, "缓存key[%s]包含未配对的右花括号", key)
+		}
+		return nil
+	}
+	end := strings.IndexByte(key[start+1:], '}')
+	if end <= 0 {
+		return errors.Wrapf(ErrInvalidClusterHashTag, "缓存key[%s]包含空或未闭合的Redis Cluster hash tag", key)
+	}
+	return nil
 }
 
 // newLockValue 生成锁持有者标识，用于释放锁时确认只删除自己的锁。
@@ -1681,10 +2145,8 @@ func (m *Manager) registerTarget(target Target) error {
 		if item.Key == target.Key {
 			return errors.Errorf("tablecache目标key重复: %s", target.Key)
 		}
-		if strings.HasSuffix(item.Key, ":") && strings.HasSuffix(target.Key, ":") {
-			if strings.HasPrefix(item.Key, target.Key) || strings.HasPrefix(target.Key, item.Key) {
-				return errors.Errorf("tablecache前缀key存在重叠: %s <-> %s", item.Key, target.Key)
-			}
+		if targetKeysOverlap(item.Key, target.Key) {
+			return errors.Errorf("tablecache目标key存在重叠: %s <-> %s", item.Key, target.Key)
 		}
 	}
 	m.targets[target.Index] = target
@@ -1717,6 +2179,27 @@ func (m *Manager) resolvePrefixTarget(prefix string) (Target, error) {
 		return target, nil
 	}
 	return Target{}, errors.Wrapf(ErrTargetNotFound, "缓存前缀[%s]未注册", prefix)
+}
+
+// targetKeysOverlap 判断两个目标的实际 Redis key 范围是否重叠。
+// 前缀目标会执行批量删除和全量重建，若固定 key 落在该前缀内，必须在启动期拒绝以避免误删其它目标。
+func targetKeysOverlap(left string, right string) bool {
+	leftPrefix := strings.HasSuffix(left, ":")
+	rightPrefix := strings.HasSuffix(right, ":")
+	switch {
+	case leftPrefix && rightPrefix:
+		// 两个前缀互相包含时会产生匹配歧义，例如 user: 与 user:profile:。
+		return strings.HasPrefix(left, right) || strings.HasPrefix(right, left)
+	case leftPrefix:
+		// 左侧是前缀、右侧是固定 key 时，只要固定 key 落入前缀范围就存在批量删除风险。
+		return strings.HasPrefix(right, left)
+	case rightPrefix:
+		// 右侧是前缀、左侧是固定 key 时，同样需要阻断固定 key 被前缀目标覆盖。
+		return strings.HasPrefix(left, right)
+	default:
+		// 两个固定 key 不相等时互不重叠；相等场景已由重复 key 校验提前处理。
+		return false
+	}
 }
 
 // refreshConcurrency 返回安全的批量刷新并发度。
@@ -1874,21 +2357,28 @@ func (m *Manager) writeHiddenEmptyMarker(ctx context.Context, target Target, key
 	if ttl <= 0 {
 		ttl = m.emptyTTL
 	}
-	return m.store.Write(ctx, Entry{
-		Key:   m.emptyKey(key),
-		Type:  TypeString,
-		Value: m.emptyMarker,
-		TTL:   ttl,
-	})
+	markerKey := m.emptyKey(key) // markerKey 表示隐藏空值占位元信息 key，需要纳入前缀索引以支持快速删除
+	mutation := StoreMutation{
+		WriteEntries: []Entry{{
+			Key:   markerKey,
+			Type:  TypeString,
+			Value: m.emptyMarker,
+			TTL:   ttl,
+		}},
+	}
+	if indexMutation, ok := m.prefixIndexMutation(target, []string{markerKey}, m.prefixKeyIndexTTL); ok {
+		mutation.AddIndex = append(mutation.AddIndex, indexMutation)
+	}
+	return m.applyStoreMutation(ctx, mutation)
 }
 
 // deleteRefreshedKey 删除当前刷新目标的业务 key 和隐藏空值元信息，避免空结果保留历史脏数据。
 func (m *Manager) deleteRefreshedKey(ctx context.Context, target Target, key string) error {
-	keys := []string{m.emptyKey(key), m.emptyCollectionKey(key)}
+	keys := []string{m.emptyKey(key), m.emptyCollectionKey(key)} // keys 表示当前刷新 key 关联的空值与空集合元信息
 	if !(strings.HasSuffix(target.Key, ":") && key == target.Key) {
 		keys = append(keys, key)
 	}
-	return m.store.Delete(ctx, keys...)
+	return m.deleteTargetKeys(ctx, target, keys...)
 }
 
 // deleteBusinessKey 删除当前刷新目标的业务 key，保留隐藏空值元信息。
@@ -1896,20 +2386,32 @@ func (m *Manager) deleteBusinessKey(ctx context.Context, target Target, key stri
 	if strings.HasSuffix(target.Key, ":") && key == target.Key {
 		return nil
 	}
-	return m.store.Delete(ctx, key)
+	return m.deleteTargetKeys(ctx, target, key)
 }
 
 // markRebuildResult 写入重建完成元信息，供等待其它实例回填时快速判断刷新已完成。
-func (m *Manager) markRebuildResult(ctx context.Context, key string) error {
+func (m *Manager) markRebuildResult(ctx context.Context, target Target, key string, lockValue string) error {
 	if m.resultTTL <= 0 {
 		return nil
 	}
-	return m.store.Write(ctx, Entry{
-		Key:   m.rebuildResultKey(key),
-		Type:  TypeString,
-		Value: time.Now().Format(time.RFC3339Nano),
-		TTL:   m.resultTTL,
-	})
+	lockValue = strings.TrimSpace(lockValue)
+	if lockValue == "" {
+		// lockValue 来自当前刷新持有的锁 owner；为空时降级为时间戳，避免写入空 marker 干扰等待方判断。
+		lockValue = time.Now().Format(time.RFC3339Nano)
+	}
+	resultKey := m.rebuildResultKey(key) // resultKey 表示短 TTL 的重建完成元信息 key，前缀删除时也需要被索引覆盖
+	mutation := StoreMutation{
+		WriteEntries: []Entry{{
+			Key:   resultKey,
+			Type:  TypeString,
+			Value: lockValue,
+			TTL:   m.resultTTL,
+		}},
+	}
+	if indexMutation, ok := m.prefixIndexMutation(target, []string{resultKey}, m.prefixKeyIndexTTL); ok {
+		mutation.AddIndex = append(mutation.AddIndex, indexMutation)
+	}
+	return m.applyStoreMutation(ctx, mutation)
 }
 
 // normalizeTarget 校验并归一化缓存目标配置。
