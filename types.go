@@ -65,7 +65,7 @@ type Target struct {
 	LoaderTimeout    time.Duration // LoaderTimeout 是当前目标回源加载超时时间，0 表示使用管理器默认值
 	RefreshAll       bool          // RefreshAll 表示刷新全部缓存时是否包含该目标
 	AllowEmptyMarker bool          // AllowEmptyMarker 表示加载空数据时是否写入空值占位
-	VisibleEmptyMark bool          // VisibleEmptyMark 表示兼容旧业务，把空值占位写入业务 key；默认只写独立元信息
+	VisibleEmptyMark bool          // VisibleEmptyMark 表示把空值占位直接写入业务 key；默认只写独立元信息
 	Loader           Loader        // Loader 是缓存回源加载器
 }
 
