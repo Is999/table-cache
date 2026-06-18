@@ -69,7 +69,7 @@ func TestManagerRefreshByKey(t *testing.T) {
 	if err := manager.RefreshByKey(ctx, "demo:404"); err != nil {
 		t.Fatalf("RefreshByKey(demo:404) error = %v", err)
 	}
-	if got := client.HGet(ctx, "demo:404", hashEmptyMarkerField).Val(); got != DefaultEmptyMarker {
+	if got := client.HGet(ctx, "demo:404", hashEmptyField).Val(); got != DefaultEmptyMarker {
 		t.Fatalf("demo:404 empty marker = %q, want %q", got, DefaultEmptyMarker)
 	}
 }
@@ -904,7 +904,7 @@ func TestManagerErrNotFoundWritesEmptyMarker(t *testing.T) {
 			AllowEmptyMarker: true,
 			VisibleEmptyMark: true,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
-				return nil, ErrNotFound
+				return nil, errors.Tag(ErrNotFound)
 			},
 		},
 	})
@@ -922,7 +922,7 @@ func TestManagerErrNotFoundWritesEmptyMarker(t *testing.T) {
 	if ok {
 		t.Fatalf("Get(missing:1) ok = true, want false")
 	}
-	if got := client.HGet(ctx, "missing:1", hashEmptyMarkerField).Val(); got != DefaultEmptyMarker {
+	if got := client.HGet(ctx, "missing:1", hashEmptyField).Val(); got != DefaultEmptyMarker {
 		t.Fatalf("empty marker = %q, want %q", got, DefaultEmptyMarker)
 	}
 }
@@ -968,6 +968,92 @@ func TestManagerDeleteByKeyAndPrefix(t *testing.T) {
 	}
 	if exists := client.Exists(ctx, "demo:", "demo:2", manager.emptyKey("demo:2"), manager.rebuildResultKey("demo:2")).Val(); exists != 0 {
 		t.Fatalf("demo prefix related keys exists = %d, want 0", exists)
+	}
+}
+
+// TestManagerDeleteByKeyWaitsInFlightRefresh 验证单 key 删除会等待同 key 刷新结束后再删除。
+func TestManagerDeleteByKeyWaitsInFlightRefresh(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	manager, err := newTestManager(NewRedisStore(client), []Target{{
+		Index: "delete-race",
+		Title: "删除刷新竞态缓存",
+		Key:   "delete-race:",
+		Type:  TypeString,
+		Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+			close(loaderStarted)
+			<-releaseLoader
+			return []Entry{{Key: params.Key, Type: TypeString, Value: "stale"}}, nil
+		},
+	}}, WithWait(5*time.Millisecond, 200))
+	if err != nil {
+		t.Fatalf("newTestManager() error = %v", err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- manager.RefreshByKey(ctx, "delete-race:1")
+	}()
+	<-loaderStarted
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- manager.DeleteByKey(ctx, "delete-race:1")
+	}()
+	select {
+	case err := <-deleteDone:
+		t.Fatalf("DeleteByKey completed before refresh released, err=%v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseLoader)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("RefreshByKey(delete-race:1) error = %v", err)
+	}
+	if err := <-deleteDone; err != nil {
+		t.Fatalf("DeleteByKey(delete-race:1) error = %v", err)
+	}
+	if exists := client.Exists(ctx, "delete-race:1").Val(); exists != 0 {
+		t.Fatalf("delete-race:1 exists = %d, want 0 after DeleteByKey", exists)
+	}
+}
+
+// TestManagerDeleteByPrefixInvalidatesInFlightRefresh 验证前缀删除会阻断已开始但尚未写回的旧单 key 刷新。
+func TestManagerDeleteByPrefixInvalidatesInFlightRefresh(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	loaderStarted := make(chan struct{})
+	releaseLoader := make(chan struct{})
+	manager, err := newTestManager(NewRedisStore(client), []Target{{
+		Index: "prefix-delete-race",
+		Title: "前缀删除刷新竞态缓存",
+		Key:   "prefix-delete-race:",
+		Type:  TypeString,
+		Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+			close(loaderStarted)
+			<-releaseLoader
+			return []Entry{{Key: params.Key, Type: TypeString, Value: "stale"}}, nil
+		},
+	}}, WithWait(5*time.Millisecond, 200))
+	if err != nil {
+		t.Fatalf("newTestManager() error = %v", err)
+	}
+	refreshDone := make(chan error, 1)
+	go func() {
+		refreshDone <- manager.RefreshByKey(ctx, "prefix-delete-race:1")
+	}()
+	<-loaderStarted
+	if err := manager.DeleteByPrefix(ctx, "prefix-delete-race:"); err != nil {
+		t.Fatalf("DeleteByPrefix(prefix-delete-race:) error = %v", err)
+	}
+	close(releaseLoader)
+	err = <-refreshDone
+	if !errors.Is(err, ErrRefreshInvalidated) {
+		t.Fatalf("RefreshByKey after prefix delete error = %v, want ErrRefreshInvalidated", err)
+	}
+	if exists := client.Exists(ctx, "prefix-delete-race:1").Val(); exists != 0 {
+		t.Fatalf("prefix-delete-race:1 exists = %d, want 0 after invalidated refresh", exists)
 	}
 }
 
@@ -1120,6 +1206,45 @@ func TestManagerDeleteByPrefixFallsBackWhenReadyIndexMissing(t *testing.T) {
 	}
 }
 
+// TestManagerDeleteByPrefixCanDisableScanFallback 验证生产可关闭索引未就绪时的全库 SCAN 降级。
+func TestManagerDeleteByPrefixCanDisableScanFallback(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	store := &deletePatternCountingStore{RedisStore: NewRedisStore(client)}
+	metrics := &recordingMetrics{}
+	logger := &recordingLogger{}
+	manager, err := newTestManager(
+		store,
+		[]Target{{Index: "no-scan", Key: "no-scan:", Type: TypeString}},
+		WithScanFallback(false),
+		WithMetrics(metrics),
+		WithLogger(logger),
+	)
+	if err != nil {
+		t.Fatalf("newTestManager() error = %v", err)
+	}
+	if err := client.Set(ctx, "no-scan:legacy", "old", 0).Err(); err != nil {
+		t.Fatalf("Set(no-scan:legacy) error = %v", err)
+	}
+	err = manager.DeleteByPrefix(ctx, "no-scan:")
+	if !errors.Is(err, ErrScanFallbackDisabled) {
+		t.Fatalf("DeleteByPrefix(no-scan:) error = %v, want ErrScanFallbackDisabled", err)
+	}
+	if got := store.deletePatternCalls.Load(); got != 0 {
+		t.Fatalf("DeletePattern calls = %d, want 0 when scan fallback disabled", got)
+	}
+	if got := metrics.scanFallback.Load(); got != 1 {
+		t.Fatalf("scanFallback metric = %d, want 1", got)
+	}
+	if !logger.contains("event=\"prefix_scan_fallback\"") {
+		t.Fatalf("prefix scan fallback log not found, logs=%v", logger.messages())
+	}
+	if exists := client.Exists(ctx, "no-scan:legacy").Val(); exists != 1 {
+		t.Fatalf("no-scan:legacy exists = %d, want 1 after disabled scan fallback", exists)
+	}
+}
+
 // TestManagerDeleteByKeyRemovesPrefixIndexMember 验证精确删除会同步移除前缀索引成员，避免索引集合长期膨胀。
 func TestManagerDeleteByKeyRemovesPrefixIndexMember(t *testing.T) {
 	ctx := context.Background()                                    // ctx 表示本次精确删除索引维护测试的生命周期上下文
@@ -1260,6 +1385,53 @@ func TestManagerDefaultKeyPrefix(t *testing.T) {
 	}
 }
 
+// TestManagerStrictKeyPrefix 验证生产严格模式会拒绝空前缀和危险前缀。
+func TestManagerStrictKeyPrefix(t *testing.T) {
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	_, err := NewManager(
+		NewRedisStore(client),
+		[]Target{{Index: "strict", Key: "strict:", Type: TypeString}},
+		WithKeyPrefix(""),
+		WithStrictKeyPrefix(true),
+	)
+	if !errors.Is(err, ErrInvalidKeyPrefix) {
+		t.Fatalf("NewManager(empty strict prefix) error = %v, want ErrInvalidKeyPrefix", err)
+	}
+	_, err = NewManager(
+		NewRedisStore(client),
+		[]Target{{Index: "strict", Key: "strict:", Type: TypeString}},
+		WithKeyPrefix("bad * prefix:"),
+		WithStrictKeyPrefix(true),
+	)
+	if !errors.Is(err, ErrInvalidKeyPrefix) {
+		t.Fatalf("NewManager(wildcard strict prefix) error = %v, want ErrInvalidKeyPrefix", err)
+	}
+}
+
+// TestManagerLogKeyRedaction 验证开启日志脱敏后不会输出完整业务 key。
+func TestManagerLogKeyRedaction(t *testing.T) {
+	logger := &recordingLogger{}
+	manager, err := newTestManager(
+		NewRedisStore(redis.NewClient(&redis.Options{Addr: miniredis.RunT(t).Addr()})),
+		nil,
+		WithLogger(logger),
+		WithLogKeyRedaction(true),
+	)
+	if err != nil {
+		t.Fatalf("newTestManager() error = %v", err)
+	}
+	manager.logInfoEvent("redact", "user", "user:secret:42", "prefix", "user:secret:", "lock_name", "user:secret:42")
+	manager.logWarnEvent("redact_error", "user", "user:secret:99", "err", errors.Errorf("缓存key[user:secret:99]写入失败"))
+	logs := strings.Join(logger.messages(), "\n")
+	if strings.Contains(logs, "user:secret") {
+		t.Fatalf("redacted logs contain raw key, logs=%v", logger.messages())
+	}
+	if !strings.Contains(logs, "sha1:") {
+		t.Fatalf("redacted logs missing hash marker, logs=%v", logger.messages())
+	}
+}
+
 // TestManagerUnprefixedLoadThroughReadOnly 验证未带指定前缀的 key 只允许查询，不会在 miss 时触发回源写入。
 func TestManagerUnprefixedLoadThroughReadOnly(t *testing.T) {
 	ctx := context.Background()
@@ -1387,7 +1559,7 @@ func TestManagerLiteralEmptyMarkerCanBeBusinessValue(t *testing.T) {
 	if err := client.Set(ctx, "hidden-literal:1", DefaultEmptyMarker, 0).Err(); err != nil {
 		t.Fatalf("Set(hidden-literal:1) error = %v", err)
 	}
-	if err := client.HSet(ctx, "visible-hash:1", hashEmptyMarkerField, DefaultEmptyMarker, "name", "alpha").Err(); err != nil {
+	if err := client.HSet(ctx, "visible-hash:1", hashEmptyField, DefaultEmptyMarker, "name", "alpha").Err(); err != nil {
 		t.Fatalf("HSet(visible-hash:1) error = %v", err)
 	}
 	var literal string
@@ -1411,7 +1583,7 @@ func TestManagerLiteralEmptyMarkerCanBeBusinessValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetState(visible-hash:1) error = %v", err)
 	}
-	if result.State != LookupStateHit || hashValue["name"] != "alpha" || hashValue[hashEmptyMarkerField] != DefaultEmptyMarker {
+	if result.State != LookupStateHit || hashValue["name"] != "alpha" || hashValue[hashEmptyField] != DefaultEmptyMarker {
 		t.Fatalf("visible hash result=%+v value=%#v, want hit with business fields", result, hashValue)
 	}
 }
@@ -1591,6 +1763,46 @@ func TestRedisStoreApplyMutationPrevalidatesWriteEntries(t *testing.T) {
 	}
 	if exists := client.Exists(ctx, "prevalidate:new").Val(); exists != 0 {
 		t.Fatalf("prevalidate:new exists = %d, want 0", exists)
+	}
+}
+
+// TestRedisStoreCollectionLimitsAndReadPage 验证集合全量读写可限流，分页读取仍可小步读取大集合。
+func TestRedisStoreCollectionLimitsAndReadPage(t *testing.T) {
+	ctx := context.Background()
+	server := miniredis.RunT(t)
+	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
+	store := NewRedisStore(client, WithMaxCollectionReadCount(2), WithMaxCollectionWriteCount(2))
+	err := store.Write(ctx, Entry{Key: "limit:list", Type: TypeList, Value: []string{"a", "b", "c"}})
+	if !errors.Is(err, ErrCollectionTooLarge) {
+		t.Fatalf("Write oversized list error = %v, want ErrCollectionTooLarge", err)
+	}
+	if exists := client.Exists(ctx, "limit:list").Val(); exists != 0 {
+		t.Fatalf("limit:list exists = %d, want 0 after rejected write", exists)
+	}
+	if err := client.RPush(ctx, "limit:list", "a", "b", "c").Err(); err != nil {
+		t.Fatalf("RPush(limit:list) error = %v", err)
+	}
+	if _, err := store.Read(ctx, "limit:list", TypeList); !errors.Is(err, ErrCollectionTooLarge) {
+		t.Fatalf("Read oversized list error = %v, want ErrCollectionTooLarge", err)
+	}
+	page, err := store.ReadPage(ctx, "limit:list", TypeList, ReadPageOptions{Start: 0, Count: 2})
+	if err != nil {
+		t.Fatalf("ReadPage(limit:list) error = %v", err)
+	}
+	values, ok := page.Value.([]string)
+	if !ok || len(values) != 2 || values[0] != "a" || values[1] != "b" {
+		t.Fatalf("ReadPage(limit:list) = %#v, want first two values", page.Value)
+	}
+	if err := client.HSet(ctx, "limit:hash", "name", "alpha", "age", "18").Err(); err != nil {
+		t.Fatalf("HSet(limit:hash) error = %v", err)
+	}
+	hashPage, err := store.ReadPage(ctx, "limit:hash", TypeHash, ReadPageOptions{Fields: []string{"age"}})
+	if err != nil {
+		t.Fatalf("ReadPage(limit:hash fields) error = %v", err)
+	}
+	hashValues, ok := hashPage.Value.(map[string]string)
+	if !ok || len(hashValues) != 1 || hashValues["age"] != "18" {
+		t.Fatalf("ReadPage(limit:hash fields) = %#v, want age=18", hashPage.Value)
 	}
 }
 
@@ -1936,7 +2148,7 @@ func TestManagerHiddenEmptyMarker(t *testing.T) {
 			Type:             TypeString,
 			AllowEmptyMarker: true,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
-				return nil, ErrNotFound
+				return nil, errors.Tag(ErrNotFound)
 			},
 		},
 	})
@@ -1975,13 +2187,13 @@ func TestManagerGetState(t *testing.T) {
 			Type:  TypeString,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 				if len(params.KeyParts) == 0 {
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				}
 				switch params.KeyParts[0] {
 				case "1":
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "alpha"}}, nil
 				case "2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2037,13 +2249,13 @@ func TestManagerGetOrRefreshHitAndEmpty(t *testing.T) {
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 				loaderCalls.Add(1)
 				if len(params.KeyParts) == 0 {
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				}
 				switch params.KeyParts[0] {
 				case "1":
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "alpha"}}, nil
 				case "2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2118,13 +2330,13 @@ func TestManagerGetOrRefreshWithLoaderAndLoadThrough(t *testing.T) {
 	loader := func(ctx context.Context, params LoadParams) ([]Entry, error) {
 		loaderCalls.Add(1)
 		if len(params.KeyParts) == 0 {
-			return nil, ErrNotFound
+			return nil, errors.Tag(ErrNotFound)
 		}
 		switch params.KeyParts[0] {
 		case "1":
 			return []Entry{{Key: params.Key, Type: TypeString, Value: "alpha"}}, nil
 		case "2":
-			return nil, ErrNotFound
+			return nil, errors.Tag(ErrNotFound)
 		default:
 			return nil, nil
 		}
@@ -2212,7 +2424,7 @@ func TestManagerLoadThroughWithOptionsDisableEmptyMarker(t *testing.T) {
 			Type:             TypeString,
 			AllowEmptyMarker: true,
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
-				return nil, ErrNotFound
+				return nil, errors.Tag(ErrNotFound)
 			},
 		},
 	})
@@ -2316,13 +2528,13 @@ func TestManagerLoadThroughBatch(t *testing.T) {
 			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 				loaderCalls.Add(1)
 				if len(params.KeyParts) == 0 {
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				}
 				switch params.KeyParts[0] {
 				case "1":
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "alpha"}}, nil
 				case "2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2374,7 +2586,7 @@ func TestManagerLoadThroughBatchWithSummary(t *testing.T) {
 				case "batch-summary:1":
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "ok"}}, nil
 				case "batch-summary:2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2507,7 +2719,7 @@ func TestManagerLoadThroughBatchWithBatchOptions(t *testing.T) {
 					}
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "alpha"}}, nil
 				case "batch-options:2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2568,7 +2780,7 @@ func TestManagerLookupMetrics(t *testing.T) {
 				case "metric:1", "metric:4":
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "ok"}}, nil
 				case "metric:2":
-					return nil, ErrNotFound
+					return nil, errors.Tag(ErrNotFound)
 				default:
 					return nil, nil
 				}
@@ -2775,6 +2987,24 @@ func TestJitterDurationBounds(t *testing.T) {
 	}
 }
 
+// TestJitterDurationWithDefaultRatio 验证未显式配置 Jitter 时可使用默认比例，也可显式关闭。
+func TestJitterDurationWithDefaultRatio(t *testing.T) {
+	base := 100 * time.Millisecond
+	for i := 0; i < 100; i++ {
+		got := jitterDurationWithDefault(base, 0, 0.2)
+		if got < base || got >= base+20*time.Millisecond {
+			t.Fatalf("jitterDurationWithDefault() = %v, want [%v,%v)", got, base, base+20*time.Millisecond)
+		}
+	}
+	if got := jitterDurationWithDefault(base, 0, 0); got != base {
+		t.Fatalf("jitterDurationWithDefault(default disabled) = %v, want %v", got, base)
+	}
+	got := jitterDurationWithDefault(base, 5*time.Millisecond, 0)
+	if got < base || got >= base+5*time.Millisecond {
+		t.Fatalf("jitterDurationWithDefault(explicit jitter) = %v, want [%v,%v)", got, base, base+5*time.Millisecond)
+	}
+}
+
 // TestManagerDefaultWaitDelayBackoff 验证默认等待策略采用递增退避，降低热点轮询压力。
 func TestManagerDefaultWaitDelayBackoff(t *testing.T) {
 	server := miniredis.RunT(t)
@@ -2944,6 +3174,26 @@ type concurrentDeletePatternStore struct {
 	calls     atomic.Int64 // calls 表示 DeletePattern 总调用次数，应覆盖业务 key 与三类内部元信息 pattern
 }
 
+// SetNX 模拟删除互斥锁获取成功，测试重点仍是 pattern 删除并发。
+func (s *concurrentDeletePatternStore) SetNX(ctx context.Context, key string, value any, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+
+// RefreshLock 模拟当前测试持有删除互斥锁。
+func (s *concurrentDeletePatternStore) RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
+	return true, nil
+}
+
+// ReleaseLock 模拟释放删除互斥锁。
+func (s *concurrentDeletePatternStore) ReleaseLock(ctx context.Context, key string, value string) (bool, error) {
+	return true, nil
+}
+
+// Write 接收删除代际写入，避免测试替身依赖真实 Redis。
+func (s *concurrentDeletePatternStore) Write(ctx context.Context, entry Entry) error {
+	return nil
+}
+
 // DeletePattern 记录并发度并模拟一次较慢的 Redis SCAN 删除任务。
 func (s *concurrentDeletePatternStore) DeletePattern(ctx context.Context, pattern string, count int64) (int64, error) {
 	current := s.active.Add(1) // current 是进入当前 pattern 删除后的实时并发数，用于更新峰值
@@ -3067,6 +3317,7 @@ type recordingMetrics struct {
 	refreshBatchCount      atomic.Int64
 	refreshBatchSuccess    atomic.Int64
 	refreshBatchFailed     atomic.Int64
+	scanFallback           atomic.Int64
 	lookupHit              atomic.Int64
 	lookupMiss             atomic.Int64
 	lookupEmpty            atomic.Int64
@@ -3124,6 +3375,11 @@ func (m *recordingMetrics) RecordRefreshBatch(ctx context.Context, mode string, 
 
 // RecordPrefixDelete 记录前缀删除次数；测试场景无需额外断言时保留空实现。
 func (m *recordingMetrics) RecordPrefixDelete(ctx context.Context, index string, prefix string, count int64) {
+}
+
+// RecordScanFallback 记录前缀删除降级扫描次数。
+func (m *recordingMetrics) RecordScanFallback(ctx context.Context, index string, prefix string) {
+	m.scanFallback.Add(1)
 }
 
 // RecordRefreshEntryCount 记录单次刷新写入条数；测试场景无需额外断言时保留空实现。

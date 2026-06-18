@@ -1,6 +1,10 @@
 package tablecache
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 // TestBuildRefreshBatchAdminResponse 验证批量刷新结果可转换为管理页标准响应结构。
 func TestBuildRefreshBatchAdminResponse(t *testing.T) {
@@ -23,8 +27,15 @@ func TestBuildRefreshBatchAdminResponse(t *testing.T) {
 	if !response.Items[0].Success {
 		t.Fatalf("response.Items[0] = %+v, want success", response.Items[0])
 	}
-	if response.Items[1].Success || response.Items[1].Error == "" {
+	if response.Items[1].Success || response.Items[1].Error == nil {
 		t.Fatalf("response.Items[1] = %+v, want failed with error", response.Items[1])
+	}
+	body, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("Marshal(response) error = %v", err)
+	}
+	if !strings.Contains(string(body), "tablecache target not found") {
+		t.Fatalf("Marshal(response) = %s, want serialized error text", string(body))
 	}
 }
 

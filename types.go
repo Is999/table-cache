@@ -106,6 +106,22 @@ type LoadThroughBatchOptions struct {
 	DefaultOptions LoadThroughOptions // DefaultOptions 是本批次所有条目的默认读穿参数，条目级 Options 优先级更高
 }
 
+// ReadPageOptions 表示集合类型分页读取配置。
+type ReadPageOptions struct {
+	Fields []string // Fields 是 Hash 指定字段读取列表；非空时优先使用 HMGET
+	Start  int64    // Start 是 List/ZSet 范围读取的起始下标
+	Stop   int64    // Stop 是 List/ZSet 范围读取的结束下标；为 0 时按 Count 或 Store 默认页大小自动计算
+	Cursor uint64   // Cursor 是 Hash/Set 游标扫描的起始游标
+	Match  string   // Match 是 Hash/Set 游标扫描的匹配表达式
+	Count  int64    // Count 是本页建议读取数量；小于等于 0 时使用 Store 默认 SCAN count
+}
+
+// ReadPageResult 表示集合类型分页读取结果。
+type ReadPageResult struct {
+	Value  any    // Value 是当前页 Redis 原始值，类型与 Read 返回值保持一致
+	Cursor uint64 // Cursor 是 Hash/Set 下一页游标；0 表示遍历完成
+}
+
 // LoadThroughBatchResult 表示单条批量读穿请求的执行结果。
 type LoadThroughBatchResult struct {
 	Key          string       `json:"key"`          // Key 是当前批量项的缓存 key

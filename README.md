@@ -1,579 +1,275 @@
 # tablecache
 
-`pkg/tablecache` 是一个框架无关的表数据缓存管理扩展包，把“缓存目标声明、数据回源、Redis 写入、刷新锁、TTL 抖动、空值占位”收口到统一组件中。
+`tablecache` 是一个框架无关的 Redis 表数据缓存管理库。它把缓存目标声明、读穿回源、批量写入、刷新锁、TTL 抖动、空值占位、前缀删除和管理页响应结构收口到一套稳定组件里，适合管理后台、定时预热任务和业务读取链路共同复用。
 
-## 设计要点
+## 特性概览
 
-- `Target` 只描述缓存元信息和加载函数，不绑定 go-zero、Gin、Kratos、GORM 或具体数据表。
-- `Store` 是缓存存储抽象，当前提供 `NewRedisStore` 适配 `go-redis`，其它框架可按接口自行适配。
-- 业务缓存 key 默认写入 `tablecache:data:` 命名空间，避免前缀删除或全量刷新误伤非 tablecache 管理的 Redis key；可通过
-  `WithKeyPrefix("project:cache:")` 设置项目前缀。刷新、删除和写回只处理已带指定前缀的实际 Redis key。
-- `RefreshByKey` 支持固定 key 与前缀型 key，例如 `project:cache:role_status`、`project:cache:config_uuid:{uuid}`。
-- `RefreshByKeys` 支持批量刷新多个 key，并自动去重。
-- `RefreshAll` 只刷新显式标记 `RefreshAll` 的目标，避免批量误刷参数化大 key，并支持有限并发控制。
-- `SetNX` 重建锁避免热点 key 缓存击穿。
-- 长耗时 Loader 运行期间会自动续期重建锁，降低锁过期后被其它实例重复重建的概率。
-- 锁值使用随机持有者标识，并通过 Lua 脚本只释放自己的锁，避免超时后误删其它实例新锁。
-- 同一进程内相同 key 的刷新请求会通过 `singleflight` 合并，减少突发流量下的 Redis 锁请求。
-- 重建成功后会写入短 TTL 结果元信息，避免“空结果但无业务 key”时等待方误判超时。
-- 多条 `Entry` 通过 `WriteBatch` 走 Redis Pipeline 批量写入，降低全量重建的网络 RTT。
-- `TTL + Jitter` 降低同类 key 集中失效导致的缓存雪崩。
-- `AllowEmptyMarker + EmptyTTL` 对不存在的数据写入短 TTL 空值占位，减少缓存穿透；默认写入独立元信息 key，避免与真实业务值碰撞。
-- `Get` 提供统一读取和反序列化入口；`GetState` 可明确区分 `hit/miss/empty`；`GetOrRefresh`、`GetOrRefreshWithLoader`、`GetOrRefreshWithOptions`、`LoadThrough`、`LoadThroughWithOptions` 可封装“缓存读取 + 回源 + 回填 + 返回”的读穿闭环。
-- `LookupMetrics` 可补充 `lookup_state_hit/miss/empty` 与 `lookup_refresh_triggered` 等细分读取指标；`ExtendedMetrics` 还可补充 `prefix_wait`、`prefix_retry` 等前缀刷新排障指标。
-- `DeleteByKey`、`DeleteByPrefix` 只允许操作缓存管理器中已注册且已带指定前缀的目标 key 或前缀，并同步清理隐藏空值元信息和短
-  TTL 重建结果元信息，避免误删任意 Redis key。
-- `DeleteByPrefix` 默认优先使用前缀 key 索引删除，避免 Redis key 特别多时扫描全库；索引未建立或 Store 不支持索引时会自动降级到
-  Redis `SCAN + UNLINK`。
-- Redis Cluster 会按 master 并发扫描降级路径；单节点大 keyspace 可通过 `WithScanCount`、`WithPrefixDeleteConcurrency`、
-  `WithScanUnlinkConcurrency`、`WithUnlinkChunkSize` 控制扫描吞吐与 Redis 压力。
-- RedisStore 实现 `MutationStore` 合并变更快路径，刷新写回时会把旧 key 删除、新 key 写入、前缀索引 SADD/SREM 尽量合并到有界
-  Pipeline，降低连接池占用和网络 RTT。
-- 刷新写回、隐藏空值标记、前缀清理和完成标记前都会复核分布式锁 owner；锁已过期或被其它实例接管时直接返回
-  `ErrRefreshLockLost`，避免旧 owner 写入脏缓存。
-- Loader 返回的 `Entry.Key` 必须是已带指定前缀的实际 Redis key，并会在写回前校验作用域：固定目标只能写固定
-  key，前缀目标只能写注册前缀内 key，避免加载器误写非托管 Redis key。
-- 启动时会拒绝固定 key 与前缀目标互相重叠，例如同时注册 `user:` 和 `user:profile`，避免 `DeleteByPrefix("user:")` 误删固定
-  key。
-- Hash/List/Set/ZSet 返回真实空集合时会写入隐藏空集合元信息，使后续 `GetState` 明确返回 `hit`，避免把“空集合”误判成 `miss` 并反复回源。
-- `Entry.Overwrite` 可控制写入前是否先删除旧 key，默认覆盖写入；显式 `tablecache.Bool(false)` 时按 Redis 结构增量更新。
-- `LoaderTimeout` 与 `WithRebuildContextPolicy(...)` 可限制单次回源时长，并控制是否继承调用方取消信号。
-- 前缀刷新采用分层互斥：前缀全量刷新独占前缀锁，同前缀单 key 刷新使用 key 级锁；若遇到全量刷新，会先等待，必要时重试，兼顾一致性和并发度。
-- 内置事件日志统一采用 `component=tablecache event=... index=... key=...` 风格，便于 gozero-admin 按字段检索 `lock_lost`、`prefix_wait`、`prefix_retry` 等场景。
-- 启动时会校验重复 `Index`、重复 `Key`、重叠前缀目标以及固定 key 落入前缀目标范围等配置问题，避免线上匹配歧义和批量删除误伤。
+| 能力 | 说明 |
+| --- | --- |
+| 读穿缓存 | `LoadThrough` / `GetOrRefresh` 先读缓存，miss 后按注册的 `Loader` 回源并写回。 |
+| 防击穿 | 同进程使用 `singleflight` 合并同 key 刷新，多实例使用 Redis `SET NX` 分布式锁。 |
+| 防穿透 | `AllowEmptyMarker` 对不存在数据写短 TTL 空值占位，默认不污染业务 key。 |
+| 防雪崩 | `TTL + Jitter` 分散过期时间；RedisStore 默认按 TTL 追加 10% 抖动。 |
+| 安全删除 | `DeleteByKey` / `DeleteByPrefix` 只允许操作已注册 key，刷新锁和 delete epoch 阻断旧刷新写回。 |
+| 大前缀治理 | 前缀 key 索引优先删除，索引不可用时才降级 `SCAN + UNLINK`。 |
+| Redis Cluster | 支持单节点和 Cluster；Cluster 降级扫描按 master 节点执行。 |
+| 集合治理 | 支持集合分页读取和集合读写上限，避免大 Hash/List/Set/ZSet 一次性拉爆内存。 |
+| 管理页响应 | 内置批量刷新、批量读穿的标准响应结构和汇总结果。 |
+| 可观测性 | 支持 Prometheus 指标、结构化事件日志和 key 脱敏。 |
 
-## 接入方式
+## 版本要求
 
-业务项目只需要：
+- Go 1.26+
+- Redis 6.2+，推荐 Redis 7+
+- 依赖 `go-redis`、Prometheus client、`go-utils` 等基础库
 
-1. 实现或复用 `Store`，gozero-admin 使用 `NewRedisStore(redis.UniversalClient)`。
-2. 声明 `[]Target`，在 `Loader` 中读取数据库并返回标准 `[]Entry`。
-3. 在缓存管理接口或业务 miss 回源位置调用 `RefreshByKey` / `RefreshAll` / `RefreshByKeys`。
-4. 在业务读取路径调用 `Get` / `GetState` / `GetOrRefresh` / `GetOrRefreshWithLoader` / `GetOrRefreshWithOptions` / `LoadThrough` / `LoadThroughWithOptions` / `LoadThroughBatch`，按是否需要显式传入 Loader、透传 fields 或批量读取选择接入方式。
+## 安装
 
-启用默认或自定义 key 前缀后，`Target.Key` 仍可声明为逻辑前缀，Manager 会在注册目标时收敛到实际 Redis key；`Get` /
-`GetState` 这类纯读取入口也可传逻辑 key 进行查询。但 `RefreshByKey`、`RefreshByKeys`、`DeleteByKey`、`DeleteByPrefix` 以及会在
-miss 后回源写入的 `LoadThrough` / `GetOrRefresh`，都必须传已带指定前缀的实际 Redis key；未带前缀的 key 只做查询，miss
-时不会回源写入。`LoadParams.Key` 会传入实际 Redis key，`LoadParams.KeyParts` 仍按目标前缀后的业务片段解析；Loader 返回的
-`Entry.Key` 必须使用 `params.Key` 或其它已带前缀且在目标范围内的实际 Redis key。
-
-Redis key 特别多时，前缀删除的主要瓶颈通常是“全库游标扫描”和“扫描后删除”两段。RedisStore 会在前缀目标写入时维护 `Set`
-索引，当前缀完成过一次全量刷新后写入可信标记；之后 `DeleteByPrefix` 会优先遍历索引集合中的成员并 `UNLINK`
-，不再扫描全库。索引未可信、索引过期、或自定义 Store 未实现 `PrefixIndexStore` 时，会自动降级到 `SCAN + UNLINK`。
-
-- `WithPrefixKeyIndex(true)`：默认启用前缀 key 索引；想完全关闭索引元信息时可显式传 `false`。
-- `WithPrefixKeyIndexTTL(30*24*time.Hour)`：控制索引集合和可信标记保留时间；建议不短于业务缓存最长 TTL。
-- `WithScanCount(1000~5000)`：索引未命中降级时减少 SCAN 网络往返，数值越大单轮 Redis 主线程工作越重。
-- `NewRedisStore(..., WithScanUnlinkConcurrency(2~4))`：降级扫描时让扫描到的 key 批次并发 `UNLINK`，重叠扫描与删除耗时。
-- `WithUnlinkChunkSize(500~1000)`：控制每个 Pipeline 的 UNLINK 数量，也会影响索引成员写入/删除的分批大小。
-- `WithPrefixDeleteConcurrency(2~4)`：降级扫描时让业务 key 与内部元信息 pattern 并发扫描；高峰期建议保持 1 或
-  2，后台清理窗口可适当提高。
-
-刷新写回性能方面，RedisStore 会自动走 `MutationStore` 快路径：同一次刷新里的旧空值元信息清理、业务 key
-写入、空集合元信息写入、前缀索引成员维护会按阶段合并为有界 Pipeline。含 `Entry.Overwrite=false` 的增量写不会自动重试，避免
-List/Set/ZSet 增量写在网络抖动后被重复放大。
-
-这样同一套缓存目标可以被管理页、业务读取 miss 重建、定时预热任务复用。
-
-## gozero-admin 接入示例
-
-推荐做法是把 `go-utils` 的日志初始化放到项目入口，只配置一次，然后缓存管理器直接复用：
-
-```go
-package main
-
-import (
-	"log/slog"
-	"os"
-)
-
-func initLogger() {
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})
-	slog.SetDefault(slog.New(handler))
-}
+```bash
+go get github.com/Is999/table-cache
 ```
 
+## 快速开始
+
+下面示例展示一个用户资料缓存：key 前缀为 `a:`，业务 key 为 `a:user:1`。
+
 ```go
-package cacheexample
+package cache
 
 import (
 	"context"
 	"strconv"
 	"time"
 
-	utils "github.com/Is999/go-utils"
-	"cron_admin/pkg/tablecache"
-
+	tablecache "github.com/Is999/table-cache"
 	"github.com/redis/go-redis/v9"
 )
 
-// User 表示业务用户缓存示例结构。
 type User struct {
-	ID   int    `json:"id"`   // ID 是用户 ID
-	Name string `json:"name"` // Name 是用户名称
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
 }
 
-// UserModel 表示示例数据库访问对象。
 type UserModel interface {
 	FindOne(ctx context.Context, id int64) (*User, error)
 }
 
-// UserCache 定义 gozero-admin 中可复用的用户缓存组件。
-type UserCache struct {
-	manager *tablecache.Manager // manager 是用户资料缓存管理器
-	model   UserModel           // model 是数据库查询适配器
-}
+func NewUserCache(client redis.UniversalClient, model UserModel) (*tablecache.Manager, error) {
+	store := tablecache.NewRedisStore(client)
 
-// NewUserCache 创建用户缓存管理器。
-func NewUserCache(client redis.UniversalClient, model UserModel) (*UserCache, error) {
-	store := tablecache.NewRedisStore(
-		client,
-		tablecache.WithUnlinkChunkSize(1000),
-		tablecache.WithScanUnlinkConcurrency(2),
-	)
-	metrics, err := tablecache.NewPrometheusMetrics(
-		tablecache.WithPrometheusNamespace("gozero_admin"),
-		tablecache.WithPrometheusSubsystem("tablecache"),
-	)
-	if err != nil {
-		return nil, err
-	}
-	manager, err := tablecache.NewManager(
-		store,
-		[]tablecache.Target{
-			{
-				Index:            "user_profile",
-				Title:            "用户资料",
-				Key:              "user_profile:",
-				KeyTitle:         "user_profile:{userID}",
-				Type:             tablecache.TypeString,
-				TTL:              time.Hour,
-				Jitter:           10 * time.Minute,
-				AllowEmptyMarker: true,
-				Loader: func(ctx context.Context, params tablecache.LoadParams) ([]tablecache.Entry, error) {
-					if len(params.KeyParts) == 0 || model == nil {
-						return nil, tablecache.ErrNotFound
-					}
-					userID, err := strconv.ParseInt(params.KeyParts[0], 10, 64)
-					if err != nil {
-						return nil, err
-					}
-					user, err := model.FindOne(ctx, userID)
-					if err != nil {
-						return nil, err
-					}
-					if user == nil {
-						return nil, tablecache.ErrNotFound
-					}
-					return []tablecache.Entry{{
-						Key:   params.Key,
-						Type:  tablecache.TypeString,
-						Value: user,
-					}}, nil
-				},
+	return tablecache.NewManager(store, []tablecache.Target{
+		{
+			Index:            "user",
+			Title:            "用户资料",
+			Key:              "user:",
+			KeyTitle:         "user:{id}",
+			Type:             tablecache.TypeString,
+			TTL:              time.Hour,
+			Jitter:           10 * time.Minute,
+			AllowEmptyMarker: true,
+			Loader: func(ctx context.Context, params tablecache.LoadParams) ([]tablecache.Entry, error) {
+				id, err := strconv.ParseInt(params.KeyParts[0], 10, 64)
+				if err != nil {
+					return nil, err
+				}
+				user, err := model.FindOne(ctx, id)
+				if err != nil {
+					return nil, err
+				}
+				if user == nil {
+					return nil, tablecache.ErrNotFound
+				}
+				return []tablecache.Entry{{
+					Key:   params.Key,
+					Type:  tablecache.TypeString,
+					Value: user,
+				}}, nil
 			},
 		},
-		tablecache.WithKeyPrefix("gozero_admin:cache:"),
-		tablecache.WithPrefixKeyIndex(true),
-		tablecache.WithPrefixKeyIndexTTL(30*24*time.Hour),
-		tablecache.WithScanCount(2000),
-		tablecache.WithPrefixDeleteConcurrency(2),
-		tablecache.WithMetrics(metrics),
-		tablecache.WithGoUtilsLogger(utils.Log()),
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &UserCache{
-		manager: manager,
-		model:   model,
-	}, nil
-}
-
-// key 根据用户 ID 生成已注册的缓存 key。
-func (c *UserCache) key(userID int64) string {
-	return "gozero_admin:cache:user_profile:" + strconv.FormatInt(userID, 10)
-}
-
-// Manager 返回底层缓存管理器，供管理页和任务调度复用。
-func (c *UserCache) Manager() *tablecache.Manager {
-	return c.manager
-}
-
-// GetForBiz 在业务读取链路中直接执行读穿缓存。
-func (c *UserCache) GetForBiz(ctx context.Context, userID int64) (*User, error) {
-	var user User
-	result, err := c.manager.LoadThrough(ctx, c.key(userID), &user, nil)
-	if err != nil {
-		return nil, err
-	}
-	if result.State == tablecache.LookupStateHit {
-		return &user, nil
-	}
-	if result.State == tablecache.LookupStateEmpty {
-		return nil, nil
-	}
-	return nil, nil
-}
-
-// GetForBizWithOptions 演示完整读穿参数的接入方式，便于业务在局部场景透传 fields 并自定义回源逻辑。
-func (c *UserCache) GetForBizWithOptions(ctx context.Context, userID int64, fields []string) (*User, error) {
-	var user User
-	result, err := c.manager.LoadThroughWithOptions(ctx, c.key(userID), &user, tablecache.LoadThroughOptions{
-		Fields: fields,
-		Loader: func(ctx context.Context, params tablecache.LoadParams) ([]tablecache.Entry, error) {
-			if c.model == nil {
-				return nil, tablecache.ErrNotFound
-			}
-			dbUser, err := c.model.FindOne(ctx, userID)
-			if err != nil {
-				return nil, err
-			}
-			if dbUser == nil {
-				return nil, tablecache.ErrNotFound
-			}
-			return []tablecache.Entry{{
-				Key:   params.Key,
-				Type:  tablecache.TypeString,
-				Value: dbUser,
-			}}, nil
-		},
-	})
-	if err != nil {
-		return nil, err
-	}
-	if result.State == tablecache.LookupStateHit {
-		return &user, nil
-	}
-	return nil, nil
-}
-
-// RefreshFromAdmin 表示 gozero-admin 管理页“手动刷新单个缓存”的链路。
-func (c *UserCache) RefreshFromAdmin(ctx context.Context, userID int64) error {
-	return c.manager.RefreshByKey(ctx, c.key(userID))
-}
-
-// WarmupByTask 表示定时预热任务链路，支持批量预热多个注册 key。
-func (c *UserCache) WarmupByTask(ctx context.Context, userIDs []int64) error {
-	keys := make([]string, 0, len(userIDs))
-	for _, userID := range userIDs {
-		keys = append(keys, c.key(userID))
-	}
-	return c.manager.RefreshByKeys(ctx, keys)
-}
-
-// WarmupByTaskWithSummary 表示预热任务链路可直接返回标准批量刷新响应。
-func (c *UserCache) WarmupByTaskWithSummary(ctx context.Context, userIDs []int64) (tablecache.RefreshBatchAdminResponse, error) {
-	keys := make([]string, 0, len(userIDs))
-	for _, userID := range userIDs {
-		keys = append(keys, c.key(userID))
-	}
-	results, summary, err := c.manager.RefreshByKeysWithSummary(ctx, keys)
-	return tablecache.BuildRefreshBatchAdminResponseWithSummary(results, summary, err), nil
-}
-
-// RefreshAllFromAdmin 表示管理页“全量刷新所有允许全量刷新的目标”时可直接返回标准响应。
-func (c *UserCache) RefreshAllFromAdmin(ctx context.Context) (tablecache.RefreshBatchAdminResponse, error) {
-	results, summary, err := c.manager.RefreshAllWithSummary(ctx)
-	return tablecache.BuildRefreshBatchAdminResponseWithSummary(results, summary, err), nil
-}
-
-// LoadThroughBatchForAdmin 表示管理页批量读取缓存状态时可直接返回的标准 JSON 结构。
-func (c *UserCache) LoadThroughBatchForAdmin(ctx context.Context, userIDs []int64) (tablecache.LoadThroughBatchAdminResponse, error) {
-	items := make([]tablecache.LoadThroughItem, 0, len(userIDs))
-	users := make([]User, len(userIDs))
-	for index, userID := range userIDs {
-		items = append(items, tablecache.LoadThroughItem{
-			Key:  c.key(userID),
-			Dest: &users[index],
-		})
-	}
-	results, summary, err := c.manager.LoadThroughBatchWithSummaryOptions(ctx, items, tablecache.LoadThroughBatchOptions{
-		Concurrency: 4,
-		DefaultOptions: tablecache.LoadThroughOptions{
-			LoaderTimeout:    300 * time.Millisecond,
-			AllowEmptyMarker: tablecache.Bool(true),
-		},
-	})
-	return tablecache.BuildLoadThroughBatchAdminResponseWithSummary(results, summary, err), nil
+	}, tablecache.WithKeyPrefix("a:"))
 }
 ```
 
-## gozero-admin 可复制模板
-
-如果你希望直接按 `gozero-admin` 常见分层落地，可以按下面这套方式组织：
-
-1. `main` 或启动入口只做一次 `slog.SetDefault(...)`；如果项目已自行实现 `utils.Logger`，也可以在这里调用 `utils.Configure(utils.WithLogger(customLogger))`。
-2. `svc.ServiceContext` 统一创建 `redis.UniversalClient` 和业务缓存组件，并把 `manager.Items()` 缓存成管理页列表。
-3. `logic` 或 `service` 层封装业务读穿、管理页刷新、批量预热。
-4. `handler` 只负责参数解析并直接返回 `BuildRefreshBatchAdminResponse...` / `BuildLoadThroughBatchAdminResponse...` 生成的标准 JSON。
-
-`svc/servicecontext.go` 示例：
-
-```go
-package svc
-
-import (
-	"your_project/internal/cache"
-	"your_project/internal/config"
-
-	"cron_admin/pkg/tablecache"
-	"github.com/redis/go-redis/v9"
-)
-
-// ServiceContext 汇总项目运行时依赖。
-type ServiceContext struct {
-	Config    config.Config         // Config 是项目配置
-	Redis     redis.UniversalClient // Redis 是全局 Redis 客户端
-	Cache     *cache.UserCache      // Cache 是业务缓存组件
-	TableList []tablecache.Item     // TableList 是缓存管理页展示列表
-}
-
-// NewServiceContext 创建服务上下文并集中初始化缓存组件。
-func NewServiceContext(c config.Config) (*ServiceContext, error) {
-	client := redis.NewUniversalClient(&redis.UniversalOptions{
-		Addrs:    c.Redis.Addrs,
-		Password: c.Redis.Password,
-		DB:       c.Redis.DB,
-	})
-	userCache, err := cache.NewUserCache(client, nil)
-	if err != nil {
-		return nil, err
-	}
-	return &ServiceContext{
-		Config:    c,
-		Redis:     client,
-		Cache:     userCache,
-		TableList: userCache.Manager().Items(),
-	}, nil
-}
-```
-
-`logic` 或 `service` 层示例：
-
-```go
-package logic
-
-import (
-	"context"
-
-	"cron_admin/pkg/tablecache"
-	"your_project/internal/svc"
-)
-
-// CacheLogic 封装缓存管理页和业务侧共用逻辑。
-type CacheLogic struct {
-	svcCtx *svc.ServiceContext // svcCtx 是服务上下文
-}
-
-// NewCacheLogic 创建缓存逻辑对象。
-func NewCacheLogic(svcCtx *svc.ServiceContext) *CacheLogic {
-	return &CacheLogic{svcCtx: svcCtx}
-}
-
-// ListItems 返回管理页需要展示的缓存目标列表。
-func (l *CacheLogic) ListItems(ctx context.Context) []tablecache.Item {
-	_ = ctx
-	return l.svcCtx.TableList
-}
-
-// RefreshUserFromAdmin 处理管理页“刷新单个用户缓存”动作。
-func (l *CacheLogic) RefreshUserFromAdmin(ctx context.Context, userID int64) error {
-	return l.svcCtx.Cache.RefreshFromAdmin(ctx, userID)
-}
-
-// WarmupUsers 处理定时任务或后台批量预热，并直接返回标准 JSON 结构。
-func (l *CacheLogic) WarmupUsers(ctx context.Context, userIDs []int64) tablecache.RefreshBatchAdminResponse {
-	response, err := l.svcCtx.Cache.WarmupByTaskWithSummary(ctx, userIDs)
-	if err != nil {
-		return tablecache.RefreshBatchAdminResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-	}
-	return response
-}
-
-// ReadUsersForAdmin 处理管理页批量读穿演示，便于直接查看 hit/miss/empty/refreshed。
-func (l *CacheLogic) ReadUsersForAdmin(ctx context.Context, userIDs []int64) tablecache.LoadThroughBatchAdminResponse {
-	response, err := l.svcCtx.Cache.LoadThroughBatchForAdmin(ctx, userIDs)
-	if err != nil {
-		return tablecache.LoadThroughBatchAdminResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-	}
-	return response
-}
-```
-
-`handler` 示例：
-
-```go
-package handler
-
-import (
-	"net/http"
-
-	"github.com/gin-gonic/gin"
-	"your_project/internal/logic"
-	"your_project/internal/svc"
-)
-
-// RegisterCacheRoutes 注册缓存管理相关接口。
-func RegisterCacheRoutes(router *gin.RouterGroup, svcCtx *svc.ServiceContext) {
-	cacheLogic := logic.NewCacheLogic(svcCtx)
-	router.GET("/tablecache/items", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"items":   cacheLogic.ListItems(c.Request.Context()),
-		})
-	})
-	router.POST("/tablecache/user/refresh", func(c *gin.Context) {
-		var request struct {
-			UserID int64 `json:"userId"` // UserID 是待刷新的用户 ID
-		}
-		if err := c.ShouldBindJSON(&request); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
-			return
-		}
-		if err := cacheLogic.RefreshUserFromAdmin(c.Request.Context(), request.UserID); err != nil {
-			c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, gin.H{"success": true, "message": "刷新成功"})
-	})
-	router.POST("/tablecache/user/warmup", func(c *gin.Context) {
-		var request struct {
-			UserIDs []int64 `json:"userIds"` // UserIDs 是待预热的用户 ID 列表
-		}
-		if err := c.ShouldBindJSON(&request); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, cacheLogic.WarmupUsers(c.Request.Context(), request.UserIDs))
-	})
-	router.POST("/tablecache/user/read", func(c *gin.Context) {
-		var request struct {
-			UserIDs []int64 `json:"userIds"` // UserIDs 是待读取的用户 ID 列表
-		}
-		if err := c.ShouldBindJSON(&request); err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
-			return
-		}
-		c.JSON(http.StatusOK, cacheLogic.ReadUsersForAdmin(c.Request.Context(), request.UserIDs))
-	})
-}
-```
-
-推荐理解方式：
-
-- `manager.Items()` 负责给管理页渲染缓存目标清单。
-- `RefreshByKey / RefreshByKeysWithSummary / RefreshAllWithSummary` 负责刷新、预热和后台批处理。
-- `LoadThrough / LoadThroughWithOptions / LoadThroughBatchWithSummaryOptions` 负责业务读穿和管理页批量读缓存状态。
-- `BuildRefreshBatchAdminResponseWithSummary(...)`、`BuildLoadThroughBatchAdminResponseWithSummary(...)` 负责把执行结果直接转成后台接口标准 JSON。
-
-## 三条链路怎么串
-
-1. 管理页刷新链路：
-   gozero-admin 的缓存管理页拿到 `manager.Items()` 渲染列表，点击“刷新用户资料缓存”时调用 `RefreshFromAdmin(ctx, userID)`，最终进入 `RefreshByKey`，只允许刷新已注册 key。
-2. 业务读取链路：
-   业务接口直接调用 `GetForBiz`，内部走 `LoadThrough`，先读缓存，只有真实 miss 才回源、回填并返回；如果命中空值占位则直接返回空对象，避免反复穿透数据库。
-3. 预热任务链路：
-   定时任务、启动预热或后台批处理调用 `WarmupByTask`，通过 `RefreshByKeys` 对一组注册 key 做有限并发预热。
-
-## 指标建议
-
-项目已内置 `PrometheusMetrics`，直接实现了 `Metrics`、`ExtendedMetrics`、`LookupMetrics`：
-
-```go
-metrics, err := tablecache.NewPrometheusMetrics(
-	tablecache.WithPrometheusNamespace("gozero_admin"),
-	tablecache.WithPrometheusSubsystem("tablecache"),
-)
-if err != nil {
-	return err
-}
-
-manager, err := tablecache.NewManager(store, targets, tablecache.WithKeyPrefix("gozero_admin:cache:"), tablecache.WithMetrics(metrics))
-if err != nil {
-	return err
-}
-_ = manager
-```
-
-- `refresh_total`、`refresh_duration_seconds` 记录刷新总次数和耗时。
-- `cache_hit_total`、`cache_miss_total`、`lock_failed_total` 记录基础命中与锁竞争情况。
-- `loader_error_total`、`empty_marker_write_total`、`wait_timeout_total`、`prefix_delete_total`、`prefix_delete_keys_total`、`refresh_entry_count` 记录扩展运行指标。
-- `prefix_wait_total`、`prefix_retry_total` 可用于观察是否有大前缀全量刷新拖慢单 key 刷新。
-- `refresh_batch_total`、`refresh_batch_size`、`refresh_batch_success_items_total`、`refresh_batch_failed_items_total` 可用于观察批量刷新和全量刷新任务的执行次数、任务规模与成功失败条目数。
-- `lookup_state_total{state="hit|miss|empty"}`、`lookup_refresh_triggered_total` 记录读穿读取链路指标。
-- `refresh_total{result="lock_lost"}` 可直接观察锁续期失败导致的刷新中止次数。
-- `WithPrometheusRegisterer(...)` 支持注入独立注册器，适合测试、多实例组件或避免全局注册器重复注册冲突。
-
-## 日志建议
-
-接入 `WithLogger(...)` 后，tablecache 会输出统一字段风格日志，便于 gozero-admin 在 Loki、ELK、Datadog 中直接检索：
-
-- `event="lock_lost"`：锁续期失败后刷新被中止。
-- `event="prefix_wait"`：单 key 刷新被同前缀全量刷新阻塞。
-- `event="prefix_retry"`：单 key 在写回前发现前缀全量刷新已开始，因此主动重试。
-- `event="lock_renew_failed"`：底层锁续期失败，通常会紧接着出现 `lock_lost`。
-- `event="refresh_batch_done"`、`event="refresh_all_done"`：批量刷新与全量刷新任务完成时输出汇总结果。
-- 推荐直接使用 `WithGoUtilsLogger(utils.Log())`；如果更喜欢统一入口，也可以继续使用 `WithLogger(utils.Log())`，两种写法都兼容。
-- 如果业务入口已经通过 `slog.SetDefault(...)` 完成统一日志初始化，`utils.Log()` 默认会复用这套 `slog` 能力；如果项目已自行实现 `utils.Logger`，也可以继续走 `utils.Configure(utils.WithLogger(customLogger))`，同样无需额外 `logxadapter`。
-
-## LoadThrough 参数建议
-
-- `LoadThrough(ctx, key, dest, nil)` 适合绝大多数标准读穿场景，直接复用目标上注册的 `Loader`。
-- `GetOrRefreshWithLoader` 适合快速补一个局部临时回源逻辑，但参数能力相对精简。
-- `LoadThroughWithOptions` 适合生产场景做统一封装，可同时传入 `Fields`、临时 `Loader`、`LoaderTimeout`、`AllowEmptyMarker`、`ContextPolicy`，便于 Hash 字段级刷新、定制回源策略、按调用收紧超时、临时关闭空值占位或忽略上游取消。
-- `LoadThroughBatch` 适合列表页、后台批处理或批量业务读场景；它会逐项返回结果，单条失败不会中断整批处理。
-- `LoadThroughBatchWithBatchOptions` 适合整批共享默认参数的场景，可统一设置批次并发度和默认 `LoadThroughOptions`，条目级参数仍可覆盖。
-- `LoadThroughBatchWithSummary` 适合任务调度、预热任务或管理页批处理；它会额外返回汇总信息和聚合错误，便于直接判断整批状态。
-- `RefreshByKeysWithSummary`、`RefreshAllWithSummary` 适合预热任务和管理页刷新接口；它们会返回逐项结果、汇总信息和聚合错误，便于直接构造标准 JSON 响应。
-
-示例：
+业务读取：
 
 ```go
 var user User
-result, err := manager.LoadThroughWithOptions(ctx, "gozero_admin:cache:user_profile:1", &user, tablecache.LoadThroughOptions{
-	Fields:           []string{"name", "status"},
-	LoaderTimeout:    200 * time.Millisecond,
-	AllowEmptyMarker: tablecache.Bool(false),
-	ContextPolicy:    tablecache.RebuildPolicy(tablecache.RebuildContextIgnoreCancel),
-})
+result, err := manager.LoadThrough(ctx, "a:user:1", &user, nil)
 if err != nil {
 	return err
 }
-_ = result
+if result.State == tablecache.LookupStateHit {
+	// user 来自缓存命中或 miss 后回源写回。
+}
 ```
 
-批量示例：
+管理页刷新：
+
+```go
+if err := manager.RefreshByKey(ctx, "a:user:1"); err != nil {
+	return err
+}
+```
+
+批量预热：
+
+```go
+results, summary, err := manager.RefreshByKeysWithSummary(ctx, []string{
+	"a:user:1",
+	"a:user:2",
+})
+response := tablecache.BuildRefreshBatchAdminResponseWithSummary(results, summary, err)
+_ = response
+```
+
+完整可运行示例见 [example/admin_integration](./example/admin_integration)。
+
+## 核心概念
+
+### Target
+
+`Target` 描述一个缓存目标。固定 key 用完整 key，前缀型 key 以冒号结尾。
+
+| 字段 | 说明 |
+| --- | --- |
+| `Index` | 稳定索引名，用于管理页、指标和日志。 |
+| `Title` | 展示名称。 |
+| `Key` | 逻辑 key 或逻辑前缀，例如 `user:`。 |
+| `KeyTitle` | 展示模板，例如 `user:{id}`。 |
+| `Type` | Redis 类型：String、Hash、List、Set、ZSet。 |
+| `TTL` / `Jitter` | 基础过期时间和最大抖动。 |
+| `EmptyTTL` | 空值占位过期时间。 |
+| `LoaderTimeout` | 当前目标回源超时时间。 |
+| `RefreshAll` | 是否允许被 `RefreshAll` 批量刷新。 |
+| `AllowEmptyMarker` | 查无数据时是否写空值占位。 |
+| `VisibleEmptyMark` | 是否把空值占位写进业务 key；默认写独立元信息。 |
+| `Loader` | 回源函数，返回要写入 Redis 的 `Entry` 列表。 |
+
+### Key 前缀
+
+默认业务 key 前缀是 `tc:`。生产项目建议显式传入短项目前缀，例如 `WithKeyPrefix("a:")`。
+
+- `Get` / `GetState` 支持传逻辑 key，会自动补前缀后只读查询。
+- `RefreshByKey`、`RefreshByKeys`、`DeleteByKey`、`DeleteByPrefix`、`LoadThrough` 和 `GetOrRefresh` 的写回路径必须传实际 key。
+- 未带前缀的 miss 请求只做只读查询，不会触发回源写入，避免误写非托管 key。
+- 可开启 `WithStrictKeyPrefix(true)`，启动期拒绝空前缀、通配符和空白字符。
+
+### Entry
+
+`Entry` 是 Loader 返回的写入单元。`Entry.Key` 必须落在当前 Target 管理范围内：
+
+- 固定目标只能写固定 key。
+- 前缀目标只能写注册前缀内的 key。
+- Hash/List/Set/ZSet 的空集合会写内部元信息，使后续读取明确返回 hit，而不是反复 miss。
+
+## 并发与一致性
+
+当多个请求同时读取一个不存在的缓存：
+
+1. 所有请求先查缓存。
+2. 同一进程内相同 key 通过 `singleflight` 合并。
+3. 多实例通过 Redis `SET NX` 重建锁竞争，只有持锁方执行 Loader。
+4. 未抢到锁的请求等待重建结果 marker，然后重新读缓存。
+5. Loader 查无数据时可写空值占位，避免热点空数据持续穿透数据库。
+6. 长 Loader 会自动续期锁；写业务 key、空值 marker、前缀清理和完成 marker 前都会复核锁 owner。
+
+删除和刷新交错时，Manager 会写 delete epoch，并在刷新写回前校验 epoch。前缀全量刷新还会使用前缀锁和前缀 epoch，避免旧单 key 刷新覆盖新全量结果。
+
+## Redis 配置建议
+
+### 单节点
+
+```go
+client := redis.NewClient(&redis.Options{
+	Addr:     "127.0.0.1:6379",
+	Password: "",
+	DB:       0,
+	PoolSize: 20,
+})
+store := tablecache.NewRedisStore(client)
+```
+
+### Cluster
+
+```go
+client := redis.NewClusterClient(&redis.ClusterOptions{
+	Addrs: []string{
+		"127.0.0.1:7001",
+		"127.0.0.1:7002",
+		"127.0.0.1:7003",
+	},
+	Password: "",
+	PoolSize: 20,
+})
+store := tablecache.NewRedisStore(client)
+```
+
+如果 Redis Cluster 返回的是容器 hostname，需要在业务 Redis 客户端层处理地址改写；真实集成测试可参考 `redis_cluster_integration_test.go` 的 `TABLECACHE_REDIS_ADDR_MAP`。
+
+## 生产配置
+
+推荐起步配置：
+
+```go
+store := tablecache.NewRedisStore(
+	client,
+	tablecache.WithUnlinkChunkSize(512),
+	tablecache.WithScanUnlinkConcurrency(1),
+	tablecache.WithMaxCollectionReadCount(5000),
+	tablecache.WithMaxCollectionWriteCount(5000),
+)
+
+manager, err := tablecache.NewManager(
+	store,
+	targets,
+	tablecache.WithKeyPrefix("a:"),
+	tablecache.WithStrictKeyPrefix(true),
+	tablecache.WithPrefixKeyIndex(true),
+	tablecache.WithPrefixKeyIndexTTL(30*24*time.Hour),
+	tablecache.WithScanFallback(false),
+	tablecache.WithScanCount(2000),
+	tablecache.WithPrefixDeleteConcurrency(1),
+	tablecache.WithRefreshConcurrency(4),
+	tablecache.WithLogKeyRedaction(true),
+)
+```
+
+| 配置 | 建议 |
+| --- | --- |
+| `WithKeyPrefix` | 使用短项目前缀，例如 `a:`、`crm:`，避免 Redis key 过长。 |
+| `WithStrictKeyPrefix` | 生产建议开启，避免空前缀或通配符误删。 |
+| `WithPrefixKeyIndex` | 默认开启，前缀删除优先走索引，减少全库 SCAN。 |
+| `WithScanFallback(false)` | 线上大 keyspace 建议关闭降级扫描，把索引缺失暴露为错误。 |
+| `WithScanCount` | 常见取值 1000 到 5000；越大单轮 Redis 压力越高。 |
+| `WithUnlinkChunkSize` | 常见取值 500 到 1000，控制 Pipeline 大小。 |
+| `WithPrefixDeleteConcurrency` | 高峰期保持 1 或 2；后台维护窗口可适当提高。 |
+| `WithMaxCollectionReadCount` | 为集合全量读取设置上限，超限返回 `ErrCollectionTooLarge`。 |
+| `WithLogKeyRedaction` | 日志含用户 ID、订单 ID 等高基数字段时建议开启。 |
+
+## API 选择
+
+| 场景 | 推荐 API |
+| --- | --- |
+| 只读缓存 | `Get` / `GetState` |
+| 业务读穿 | `LoadThrough` |
+| 读穿并临时覆盖 Loader、超时或 fields | `LoadThroughWithOptions` |
+| 批量读穿 | `LoadThroughBatchWithSummaryOptions` |
+| 管理页刷新单 key | `RefreshByKey` |
+| 定时任务批量预热 | `RefreshByKeysWithSummary` |
+| 管理页全量刷新 | `RefreshAllWithSummary` |
+| 精确删除 | `DeleteByKey` |
+| 前缀删除 | `DeleteByPrefix` |
+| 集合局部读取 | `CollectionPageStore.ReadPage` |
+
+批量读穿示例：
 
 ```go
 var user1 User
 var user2 User
-results := manager.LoadThroughBatch(ctx, []tablecache.LoadThroughItem{
-{Key: "gozero_admin:cache:user_profile:1", Dest: &user1},
-{Key: "gozero_admin:cache:user_profile:2", Dest: &user2},
-})
-for _, result := range results {
-	if result.Error != nil {
-		continue
-	}
-	_ = result.LookupResult
-}
-```
 
-批次级默认参数示例：
-
-```go
-results := manager.LoadThroughBatchWithBatchOptions(ctx, []tablecache.LoadThroughItem{
-{Key: "gozero_admin:cache:user_profile:1", Dest: &user1},
-{Key: "gozero_admin:cache:user_profile:2", Dest: &user2},
+results, summary, err := manager.LoadThroughBatchWithSummaryOptions(ctx, []tablecache.LoadThroughItem{
+	{Key: "a:user:1", Dest: &user1},
+	{Key: "a:user:2", Dest: &user2},
 }, tablecache.LoadThroughBatchOptions{
 	Concurrency: 4,
 	DefaultOptions: tablecache.LoadThroughOptions{
@@ -582,49 +278,105 @@ results := manager.LoadThroughBatchWithBatchOptions(ctx, []tablecache.LoadThroug
 		ContextPolicy:    tablecache.RebuildPolicy(tablecache.RebuildContextIgnoreCancel),
 	},
 })
-_ = results
+response := tablecache.BuildLoadThroughBatchAdminResponseWithSummary(results, summary, err)
+_ = response
 ```
 
-汇总示例：
+## 指标
+
+`PrometheusMetrics` 同时实现基础指标、扩展指标、读穿指标、批量刷新指标和扫描降级指标。
 
 ```go
-results, summary, err := manager.LoadThroughBatchWithSummary(ctx, []tablecache.LoadThroughItem{
-{Key: "gozero_admin:cache:user_profile:1", Dest: &user1},
-{Key: "gozero_admin:cache:user_profile:2", Dest: &user2},
-})
+metrics, err := tablecache.NewPrometheusMetrics(
+	tablecache.WithPrometheusNamespace("admin"),
+	tablecache.WithPrometheusSubsystem("tablecache"),
+)
 if err != nil {
 	return err
 }
-_ = results
-_ = summary
+
+manager, err := tablecache.NewManager(store, targets, tablecache.WithMetrics(metrics))
 ```
 
-管理页标准 JSON 示例：
+| 指标 | 说明 |
+| --- | --- |
+| `refresh_total` / `refresh_duration_seconds` | 刷新次数和耗时。 |
+| `cache_hit_total` / `cache_miss_total` | 基础命中和 miss。 |
+| `lock_failed_total` | 重建锁竞争失败次数。 |
+| `loader_error_total` | Loader 回源错误次数。 |
+| `empty_marker_write_total` | 空值占位写入次数。 |
+| `wait_timeout_total` | 等待其它实例重建超时次数。 |
+| `prefix_wait_total` / `prefix_retry_total` | 前缀全量刷新对单 key 刷新的影响。 |
+| `prefix_delete_total` / `prefix_delete_keys_total` | 前缀删除次数和删除 key 数。 |
+| `lookup_state_total` | 读穿最终状态：hit、miss、empty。 |
+| `lookup_refresh_triggered_total` | 读穿触发回源次数。 |
+| `scan_fallback_total` | 前缀索引不可用时降级扫描次数。 |
 
-```go
-response, err := userCache.LoadThroughBatchForAdmin(ctx, []int64{1, 2, 3})
-if err != nil {
-	return err
-}
-return response
+## 日志
+
+接入 `WithLogger(...)` 或 `WithGoUtilsLogger(...)` 后，日志统一输出稳定字段：
+
+```text
+component=tablecache event=prefix_wait index=user key=a:user:1
 ```
 
-批量刷新标准 JSON 示例：
+常见事件：
 
-```go
-response, err := userCache.WarmupByTaskWithSummary(ctx, []int64{1, 2, 3})
-if err != nil {
-	return err
-}
-return response
+| 事件 | 含义 |
+| --- | --- |
+| `lock_lost` | 刷新过程中锁丢失，写回被中止。 |
+| `lock_renew_failed` | 锁续期失败。 |
+| `prefix_wait` | 单 key 刷新正在等待同前缀全量刷新。 |
+| `prefix_retry` | 单 key 刷新发现前缀代际变化后主动重试。 |
+| `prefix_scan_fallback` | 前缀索引不可用，降级为 SCAN。 |
+| `refresh_batch_done` / `refresh_all_done` | 批量刷新或全量刷新完成。 |
+
+## 管理后台接入
+
+推荐按三层接入：
+
+1. `svc` 层创建 `redis.UniversalClient`、`Store`、`Manager`，并缓存 `manager.Items()` 供页面展示。
+2. `logic` 或 `service` 层封装 `RefreshByKey`、`RefreshByKeysWithSummary`、`LoadThroughBatchWithSummaryOptions`。
+3. `handler` 层只做参数解析和响应输出，直接复用 `BuildRefreshBatchAdminResponse...` 或 `BuildLoadThroughBatchAdminResponse...`。
+
+完整模板见 [example/admin_integration](./example/admin_integration)。
+
+## 测试
+
+基础验证：
+
+```bash
+go test ./... -count=1
+go test -race ./... -count=1
+go vet ./...
 ```
 
-全量刷新标准 JSON 示例：
+真实 Redis 集成测试：
 
-```go
-response, err := userCache.RefreshAllFromAdmin(ctx)
-if err != nil {
-	return err
-}
-return response
+```bash
+TABLECACHE_REDIS_SINGLE_ADDR='127.0.0.1:6380' \
+TABLECACHE_REDIS_SINGLE_DB='0' \
+TABLECACHE_REDIS_CLUSTER_ADDRS='127.0.0.1:7001,127.0.0.1:7002,127.0.0.1:7003' \
+go test -count=1 -run 'TestRedis(Single|Cluster)Integration' -v ./...
 ```
+
+可选环境变量：
+
+| 变量 | 说明 |
+| --- | --- |
+| `TABLECACHE_REDIS_SINGLE_ADDR` | 单节点 Redis 地址。 |
+| `TABLECACHE_REDIS_SINGLE_PASSWORD` | 单节点 Redis 密码。 |
+| `TABLECACHE_REDIS_SINGLE_DB` | 单节点 Redis DB。 |
+| `TABLECACHE_REDIS_CLUSTER_ADDRS` | Cluster 种子节点，逗号分隔。 |
+| `TABLECACHE_REDIS_CLUSTER_PASSWORD` | Cluster 密码。 |
+| `TABLECACHE_REDIS_ADDR_MAP` | Cluster 返回内网 hostname 时的地址改写，格式 `host=ip,host2=ip2`。 |
+
+## 上线检查
+
+- 所有 Target 的 `Index`、`Key` 不重复且不重叠。
+- 生产项目显式配置短 `WithKeyPrefix`，并开启 `WithStrictKeyPrefix(true)`。
+- 大前缀删除开启索引；如果不允许线上全库扫描，配置 `WithScanFallback(false)`。
+- Loader 返回的 `Entry.Key` 使用 `params.Key` 或同 Target 范围内 key。
+- 不存在数据的热点 key 开启 `AllowEmptyMarker`。
+- 大集合配置读写上限，并优先使用 `ReadPage` 做局部读取。
+- 指标、日志和告警至少覆盖 `loader_error_total`、`wait_timeout_total`、`lock_lost`、`prefix_scan_fallback`。

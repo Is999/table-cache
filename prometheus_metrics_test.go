@@ -37,6 +37,7 @@ func TestPrometheusMetricsRecord(t *testing.T) {
 	metrics.RecordLookupState(ctx, "user", LookupStateEmpty)
 	metrics.RecordLookupRefreshTriggered(ctx, "user")
 	metrics.RecordRefreshBatch(ctx, "keys", "partial_failed", 3, 2, 1)
+	metrics.RecordScanFallback(ctx, "user", "user:")
 
 	metricFamilies, err := registry.Gather()
 	if err != nil {
@@ -60,6 +61,7 @@ func TestPrometheusMetricsRecord(t *testing.T) {
 	assertMetricCounter(t, metricFamilies, "tablecache_test_refresh_batch_total", map[string]string{"mode": "keys", "result": "partial_failed"}, 1)
 	assertMetricCounter(t, metricFamilies, "tablecache_test_refresh_batch_success_items_total", map[string]string{"mode": "keys"}, 2)
 	assertMetricCounter(t, metricFamilies, "tablecache_test_refresh_batch_failed_items_total", map[string]string{"mode": "keys"}, 1)
+	assertMetricCounter(t, metricFamilies, "tablecache_test_scan_fallback_total", map[string]string{"index": "user"}, 1)
 	assertHistogramSampleCount(t, metricFamilies, "tablecache_test_refresh_duration_seconds", map[string]string{"index": "user", "result": "success"}, 1)
 	assertHistogramSampleCount(t, metricFamilies, "tablecache_test_refresh_entry_count", map[string]string{"index": "user"}, 1)
 	assertHistogramSampleCount(t, metricFamilies, "tablecache_test_refresh_batch_size", map[string]string{"mode": "keys", "result": "partial_failed"}, 1)

@@ -34,6 +34,13 @@ type ExistsMultiStore interface {
 	ExistsMulti(ctx context.Context, keys ...string) (map[string]bool, error)
 }
 
+// CollectionPageStore 表示可选的集合分页读取能力。
+// RedisStore 默认实现该接口；业务可用它替代 HGetAll/LRange 0 -1 等全量读取。
+type CollectionPageStore interface {
+	// ReadPage 按缓存类型分页读取 Redis 原始值。
+	ReadPage(ctx context.Context, key string, typ CacheType, options ReadPageOptions) (ReadPageResult, error)
+}
+
 // PrefixIndexStore 定义前缀目标的 key 索引能力，用于大 keyspace 下绕开全库 SCAN。
 // RedisStore 默认实现该接口；自定义 Store 未实现时 Manager 会自动降级为 DeletePattern 扫描删除。
 type PrefixIndexStore interface {
@@ -112,6 +119,13 @@ type RefreshBatchMetrics interface {
 	Metrics
 	// RecordRefreshBatch 记录批量刷新/全量刷新任务的汇总信息。
 	RecordRefreshBatch(ctx context.Context, mode string, result string, total int, success int, failed int)
+}
+
+// ScanFallbackMetrics 定义前缀删除降级全库扫描的可选指标。
+type ScanFallbackMetrics interface {
+	Metrics
+	// RecordScanFallback 记录一次 DeleteByPrefix 索引未命中后的 SCAN 降级。
+	RecordScanFallback(ctx context.Context, index string, prefix string)
 }
 
 // Logger 定义可选日志接口，兼容传统 printf 风格日志实现。
