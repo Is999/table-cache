@@ -349,7 +349,7 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 	if lastErr == nil {
 		lastErr = errors.New("没有可用的 Redis Cluster 种子节点")
 	}
-	return nil, lastErr
+	return nil, errors.Tag(lastErr)
 }
 
 // loadClusterSlotsCompatForTest 优先使用 ClusterShards；若目标 Redis 版本不支持，则自动回退到 ClusterSlots。
@@ -363,7 +363,7 @@ func loadClusterSlotsCompatForTest(ctx context.Context, seedClient *redis.Client
 	}
 	slots, err := loadLegacyClusterSlotsForTest(ctx, seedClient)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	for slotIndex, slot := range slots {
 		for nodeIndex, node := range slot.Nodes {

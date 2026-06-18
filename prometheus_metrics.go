@@ -45,6 +45,7 @@ type PrometheusMetrics struct {
 	refreshBatchSize            *prometheus.HistogramVec // refreshBatchSize 记录每次批量刷新涉及的目标数量
 	refreshBatchSuccessItems    *prometheus.CounterVec   // refreshBatchSuccessItems 记录批量刷新成功条目数量
 	refreshBatchFailedItems     *prometheus.CounterVec   // refreshBatchFailedItems 记录批量刷新失败条目数量
+	scanFallbackTotal           *prometheus.CounterVec   // scanFallbackTotal 记录前缀删除降级 SCAN 次数
 }
 
 // WithPrometheusNamespace 设置 Prometheus 指标命名空间。
@@ -332,6 +333,18 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 	if err != nil {
 		return nil, errors.Tag(err)
 	}
+	metrics.scanFallbackTotal, err = registerCounterVec(config.Registerer, prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: config.Namespace,
+			Subsystem: config.Subsystem,
+			Name:      "scan_fallback_total",
+			Help:      "tablecache prefix delete scan fallback total count",
+		},
+		[]string{"index"},
+	))
+	if err != nil {
+		return nil, errors.Tag(err)
+	}
 	return metrics, nil
 }
 
@@ -408,6 +421,11 @@ func (m *PrometheusMetrics) RecordRefreshBatch(ctx context.Context, mode string,
 	m.refreshBatchSize.WithLabelValues(mode, result).Observe(float64(total))
 	m.refreshBatchSuccessItems.WithLabelValues(mode).Add(float64(success))
 	m.refreshBatchFailedItems.WithLabelValues(mode).Add(float64(failed))
+}
+
+// RecordScanFallback 记录前缀删除降级 SCAN 次数。
+func (m *PrometheusMetrics) RecordScanFallback(ctx context.Context, index string, prefix string) {
+	m.scanFallbackTotal.WithLabelValues(index).Inc()
 }
 
 // registerCounterVec 注册 CounterVec；若已注册则复用已有 Collector。
