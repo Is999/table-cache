@@ -109,7 +109,7 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 	store := tablecache.NewRedisStore(client)
 	// metrics 是示例 Prometheus 指标实现。
 	metrics, err := tablecache.NewPrometheusMetrics(
-		tablecache.WithPrometheusNamespace("gozero_admin"),
+		tablecache.WithPrometheusNamespace("admin"),
 		tablecache.WithPrometheusSubsystem("tablecache"),
 	)
 	if err != nil {
@@ -131,7 +131,7 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 				// keyParts 用于提取参数化缓存 key 中的业务主键。
 				keyParts := params.KeyParts
 				if len(keyParts) == 0 || model == nil {
-					return nil, tablecache.ErrNotFound
+					return nil, errors.Tag(tablecache.ErrNotFound)
 				}
 				// userID 是当前请求命中的用户 ID。
 				userID, err := strconv.ParseInt(keyParts[0], 10, 64)
@@ -144,7 +144,7 @@ func NewUserCache(client redis.UniversalClient, model userModel) (*UserCache, er
 					return nil, errors.Tag(err)
 				}
 				if user == nil {
-					return nil, tablecache.ErrNotFound
+					return nil, errors.Tag(tablecache.ErrNotFound)
 				}
 				return []tablecache.Entry{{
 					Key:   params.Key,
@@ -211,7 +211,7 @@ func (c *UserCache) WarmupByTaskWithSummary(ctx context.Context, userIDs []int64
 	}
 	// results 和 summary 用于直接构造后台标准 JSON 响应。
 	results, summary, err := c.manager.RefreshByKeysWithSummary(ctx, keys)
-	return tablecache.BuildRefreshBatchAdminResponseWithSummary(results, summary, err), nil
+	return tablecache.BuildRefreshBatchAdminResponseWithSummary(results, summary, nil), errors.Tag(err)
 }
 
 // LoadThroughBatchForAdmin 处理管理页批量读缓存状态。
@@ -234,7 +234,7 @@ func (c *UserCache) LoadThroughBatchForAdmin(ctx context.Context, userIDs []int6
 			AllowEmptyMarker: tablecache.Bool(true),
 		},
 	})
-	return tablecache.BuildLoadThroughBatchAdminResponseWithSummary(results, summary, err), nil
+	return tablecache.BuildLoadThroughBatchAdminResponseWithSummary(results, summary, nil), errors.Tag(err)
 }
 
 // ServiceContext 汇总示例服务运行时依赖。
@@ -296,29 +296,17 @@ func (l *CacheLogic) RefreshUserFromAdmin(ctx context.Context, userID int64) err
 }
 
 // WarmupUsers 处理定时预热任务并返回标准批量刷新响应。
-func (l *CacheLogic) WarmupUsers(ctx context.Context, userIDs []int64) tablecache.RefreshBatchAdminResponse {
+func (l *CacheLogic) WarmupUsers(ctx context.Context, userIDs []int64) (tablecache.RefreshBatchAdminResponse, error) {
 	// response 是当前预热任务的标准响应结构。
 	response, err := l.svcCtx.Cache.WarmupByTaskWithSummary(ctx, userIDs)
-	if err != nil {
-		return tablecache.RefreshBatchAdminResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-	}
-	return response
+	return response, errors.Tag(err)
 }
 
 // ReadUsersForAdmin 处理管理页批量读取缓存状态。
-func (l *CacheLogic) ReadUsersForAdmin(ctx context.Context, userIDs []int64) tablecache.LoadThroughBatchAdminResponse {
+func (l *CacheLogic) ReadUsersForAdmin(ctx context.Context, userIDs []int64) (tablecache.LoadThroughBatchAdminResponse, error) {
 	// response 是当前批量读穿的标准响应结构。
 	response, err := l.svcCtx.Cache.LoadThroughBatchForAdmin(ctx, userIDs)
-	if err != nil {
-		return tablecache.LoadThroughBatchAdminResponse{
-			Success: false,
-			Message: err.Error(),
-		}
-	}
-	return response
+	return response, errors.Tag(err)
 }
 
 // userIDRequest 表示单个用户操作请求。
@@ -489,7 +477,10 @@ func loadClusterSlotsWithAddrMap(ctx context.Context, addrs []string, password s
 		}
 		return slots, nil
 	}
-	return nil, lastErr
+	if lastErr == nil {
+		lastErr = errors.New("没有可用的 Redis Cluster 种子节点")
+	}
+	return nil, errors.Tag(lastErr)
 }
 
 // loadClusterSlotsCompat 优先使用 ClusterShards；若目标 Redis 版本不支持，则自动回退到 ClusterSlots。
@@ -503,7 +494,7 @@ func loadClusterSlotsCompat(ctx context.Context, seedClient *redis.Client, addrM
 	}
 	slots, err := loadLegacyClusterSlots(ctx, seedClient)
 	if err != nil {
-		return nil, err
+		return nil, errors.Tag(err)
 	}
 	for slotIndex, slot := range slots {
 		for nodeIndex, node := range slot.Nodes {
@@ -642,7 +633,12 @@ func registerRoutes(mux *http.ServeMux, svcCtx *ServiceContext) {
 			writeJSON(writer, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 			return
 		}
-		writeJSON(writer, http.StatusOK, cacheLogic.WarmupUsers(request.Context(), payload.UserIDs))
+		response, err := cacheLogic.WarmupUsers(request.Context(), payload.UserIDs)
+		if err != nil {
+			response.Success = false
+			response.Error = err
+		}
+		writeJSON(writer, http.StatusOK, response)
 	})
 	mux.HandleFunc("/tablecache/user/read", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
@@ -655,7 +651,12 @@ func registerRoutes(mux *http.ServeMux, svcCtx *ServiceContext) {
 			writeJSON(writer, http.StatusBadRequest, map[string]any{"success": false, "message": err.Error()})
 			return
 		}
-		writeJSON(writer, http.StatusOK, cacheLogic.ReadUsersForAdmin(request.Context(), payload.UserIDs))
+		response, err := cacheLogic.ReadUsersForAdmin(request.Context(), payload.UserIDs)
+		if err != nil {
+			response.Success = false
+			response.Error = err
+		}
+		writeJSON(writer, http.StatusOK, response)
 	})
 	mux.HandleFunc("/biz/user", func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodGet {
@@ -691,7 +692,7 @@ func writeJSON(writer http.ResponseWriter, statusCode int, value any) {
 	_ = json.NewEncoder(writer).Encode(value)
 }
 
-// main 启动 gozero-admin 风格的最小可运行示例。
+// main 启动管理后台接入的最小可运行示例。
 func main() {
 	// 统一初始化项目日志。
 	initLogger()
@@ -716,7 +717,7 @@ func main() {
 	}
 
 	// 使用 go-utils 统一输出启动日志，便于直接观察示例入口配置方式。
-	utils.Log().Info("gozero_admin_like_example_started", "addr", config.HTTPAddr, "redis_addrs", config.RedisAddrs)
+	utils.Log().Info("admin_integration_example_started", "addr", config.HTTPAddr, "redis_addrs", config.RedisAddrs)
 	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		panic(err)
 	}

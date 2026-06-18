@@ -1,6 +1,10 @@
 package tablecache
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 // TestBuildLoadThroughBatchAdminResponse 验证批量读穿结果可转换为管理页标准响应结构。
 func TestBuildLoadThroughBatchAdminResponse(t *testing.T) {
@@ -33,8 +37,15 @@ func TestBuildLoadThroughBatchAdminResponse(t *testing.T) {
 	if !response.Items[0].Success || response.Items[0].State != LookupStateHit || !response.Items[0].Refreshed {
 		t.Fatalf("response.Items[0] = %+v, want success hit refreshed", response.Items[0])
 	}
-	if response.Items[2].Success || response.Items[2].Error == "" {
+	if response.Items[2].Success || response.Items[2].Error == nil {
 		t.Fatalf("response.Items[2] = %+v, want failed with error", response.Items[2])
+	}
+	body, err := json.Marshal(response)
+	if err != nil {
+		t.Fatalf("Marshal(response) error = %v", err)
+	}
+	if !strings.Contains(string(body), "tablecache target not found") {
+		t.Fatalf("Marshal(response) = %s, want serialized error text", string(body))
 	}
 }
 
@@ -56,5 +67,9 @@ func TestBuildLoadThroughBatchAdminResponseWithSummary(t *testing.T) {
 	}
 	if response.Summary.Total != 1 || len(response.Items) != 1 {
 		t.Fatalf("response = %+v, want one success item", response)
+	}
+	response = BuildLoadThroughBatchAdminResponseWithSummary(results, summary, ErrTargetNotFound)
+	if response.Error == nil {
+		t.Fatalf("response.Error = nil, want aggregate error")
 	}
 }
