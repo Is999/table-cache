@@ -52,6 +52,8 @@ const (
 const (
 	// hashEmptyField 表示 Hash 类型 visible 空值占位使用的保留字段名，避免与业务真实字段发生碰撞。
 	hashEmptyField = "__tc_empty__"
+	// metaKeyRoot 表示内部元信息 Redis key 根前缀，保持短前缀并与默认业务前缀 tc: 区分。
+	metaKeyRoot = "tcm"
 )
 
 var (
@@ -2070,23 +2072,38 @@ func (m *Manager) prefixDeleteEpochKey(prefix string) string {
 	return tablecacheMetaKey("delete:prefix_epoch", prefix)
 }
 
-// tablecacheMetaKey 生成内部元信息 key，并附带 Redis Cluster hash tag。
-// 业务 key 自带合法 {...} tag 时沿用该 tag；否则使用完整业务 key，确保常规 key 的元信息可与业务 key 同槽。
+// tablecacheMetaKey 生成内部元信息 key，并保持 Redis Cluster 同槽。
+// 业务 key 自带合法 {...} tag 时沿用该 tag；否则把完整业务 key 作为 hash tag，避免重复拼接导致 key 过长。
 func tablecacheMetaKey(kind string, key string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "unknown"
+	}
 	key = strings.TrimSpace(key)
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:" + kind + ":" + key + ":{" + redisClusterHashTag(key) + "}"
+	if hasRedisClusterHashTag(key) {
+		return metaKeyRoot + ":" + kind + ":" + key
+	}
+	return metaKeyRoot + ":" + kind + ":{" + key + "}"
 }
 
-// tablecacheMetaKeyPattern 返回前缀清理元信息时使用的 pattern；hash tag 位于 key 后缀，因此这里按 key 前缀匹配。
+// tablecacheMetaKeyPattern 返回前缀清理元信息时使用的 pattern。
 func tablecacheMetaKeyPattern(kind string, prefix string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "unknown"
+	}
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
 		prefix = "unknown"
 	}
-	return "tablecache:" + kind + ":" + prefix + "*"
+	if hasRedisClusterHashTag(prefix) {
+		return metaKeyRoot + ":" + kind + ":" + prefix + "*"
+	}
+	// 普通 key 的元信息形如 tcm:{kind}:{prefix...}，pattern 保留左花括号即可匹配整段前缀。
+	return metaKeyRoot + ":" + kind + ":{" + prefix + "*"
 }
 
 // redisClusterHashTag 返回 Redis Cluster 对 key 实际使用的 hash tag；无显式 tag 时使用完整 key。
@@ -2100,6 +2117,15 @@ func redisClusterHashTag(key string) string {
 		return key
 	}
 	return key[start+1 : start+1+end]
+}
+
+// hasRedisClusterHashTag 判断 key 是否包含 Redis Cluster 会实际采用的非空 hash tag。
+func hasRedisClusterHashTag(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	return redisClusterHashTag(key) != key
 }
 
 // validateRedisClusterHashTagKey 拒绝无法让 tablecache 元信息 key 与业务 key 保持同槽的异常花括号形式。

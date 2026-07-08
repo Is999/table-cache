@@ -1673,7 +1673,7 @@ func TestRedisStorePrefixIndexMethods(t *testing.T) {
 	server := miniredis.RunT(t)                                    // server 提供内存 Redis，用于验证 Set 索引行为
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()}) // client 是 RedisStore 使用的底层客户端
 	store := NewRedisStore(client, WithUnlinkChunkSize(2))         // store 使用小 chunk 覆盖索引删除的分批路径
-	indexKey := "tablecache:index:test"                            // indexKey 表示测试使用的前缀索引集合 key
+	indexKey := "tcm:index:test"                                   // indexKey 表示测试使用的前缀索引集合 key
 	if err := client.MSet(ctx, "indexed-store:1", "one", "indexed-store:2", "two", "indexed-store:keep", "keep").Err(); err != nil {
 		t.Fatalf("MSet indexed-store keys error = %v", err)
 	}
@@ -1701,7 +1701,7 @@ func TestRedisStoreApplyMutation(t *testing.T) {
 	server := miniredis.RunT(t)                                    // server 提供内存 Redis，用于验证变更结果
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()}) // client 是 RedisStore 使用的底层客户端
 	store := NewRedisStore(client, WithUnlinkChunkSize(2))
-	indexKey := "tablecache:index:mutation" // indexKey 表示本次测试使用的前缀索引集合 key
+	indexKey := "tcm:index:mutation" // indexKey 表示本次测试使用的前缀索引集合 key
 	if err := client.MSet(ctx, "mutation:old", "old", "mutation:stale", "stale").Err(); err != nil {
 		t.Fatalf("MSet old keys error = %v", err)
 	}
@@ -1740,7 +1740,7 @@ func TestRedisStoreApplyMutationPrevalidatesWriteEntries(t *testing.T) {
 	server := miniredis.RunT(t)
 	client := redis.NewClient(&redis.Options{Addr: server.Addr()})
 	store := NewRedisStore(client)
-	indexKey := "tablecache:index:prevalidate"
+	indexKey := "tcm:index:prevalidate"
 	if err := client.Set(ctx, "prevalidate:old", "old", 0).Err(); err != nil {
 		t.Fatalf("Set(prevalidate:old) error = %v", err)
 	}
@@ -1860,6 +1860,12 @@ func TestTablecacheMetaKeysUseClusterHashTags(t *testing.T) {
 	if got := redisClusterHashTag("user:{42}:profile"); got != "42" {
 		t.Fatalf("redisClusterHashTag(user:{42}:profile) = %q, want 42", got)
 	}
+	if hasRedisClusterHashTag("user:1") {
+		t.Fatalf("hasRedisClusterHashTag(user:1) = true, want false")
+	}
+	if !hasRedisClusterHashTag("user:{42}:profile") {
+		t.Fatalf("hasRedisClusterHashTag(user:{42}:profile) = false, want true")
+	}
 	manager, err := newTestManager(NewRedisStore(redis.NewClient(&redis.Options{Addr: miniredis.RunT(t).Addr()})), []Target{
 		{Index: "user", Key: "user:", Type: TypeString, Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) { return nil, nil }},
 	})
@@ -1877,14 +1883,14 @@ func TestTablecacheMetaKeysUseClusterHashTags(t *testing.T) {
 			t.Fatalf("meta key %q missing cluster hash tag", metaKey)
 		}
 	}
-	if got := manager.emptyKey("user:1"); got != "tablecache:empty:user:1:{user:1}" {
-		t.Fatalf("emptyKey(user:1) = %q, want tagged meta key", got)
+	if got := manager.emptyKey("user:1"); got != "tcm:empty:{user:1}" {
+		t.Fatalf("emptyKey(user:1) = %q, want compact tagged meta key", got)
 	}
-	if got := manager.lockKey("user:{42}:profile"); got != "tablecache:rebuild:lock:user:{42}:profile:{42}" {
+	if got := manager.lockKey("user:{42}:profile"); got != "tcm:rebuild:lock:user:{42}:profile" {
 		t.Fatalf("lockKey(user:{42}:profile) = %q, want existing tag reused", got)
 	}
-	if got := tablecacheMetaKeyPattern("empty", "user:"); got != "tablecache:empty:user:*" {
-		t.Fatalf("tablecacheMetaKeyPattern(empty,user:) = %q, want tablecache:empty:user:*", got)
+	if got := tablecacheMetaKeyPattern("empty", "user:"); got != "tcm:empty:{user:*" {
+		t.Fatalf("tablecacheMetaKeyPattern(empty,user:) = %q, want tcm:empty:{user:*", got)
 	}
 }
 
