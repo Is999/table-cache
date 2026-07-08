@@ -148,6 +148,7 @@ _ = response
 ### Key 前缀
 
 默认业务 key 前缀是 `tc:`。生产项目建议显式传入短项目前缀，例如 `WithKeyPrefix("a:")`。
+内部锁、空值占位、前缀索引等元信息 key 使用短根前缀 `tcm:`，与业务 key 前缀分开管理。
 
 - `Get` / `GetState` 支持传逻辑 key，会自动补前缀后只读查询。
 - `RefreshByKey`、`RefreshByKeys`、`DeleteByKey`、`DeleteByPrefix`、`LoadThrough` 和 `GetOrRefresh` 的写回路径必须传实际 key。

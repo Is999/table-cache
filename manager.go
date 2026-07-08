@@ -52,6 +52,8 @@ const (
 const (
 	// hashEmptyField 表示 Hash 类型 visible 空值占位使用的保留字段名，避免与业务真实字段发生碰撞。
 	hashEmptyField = "__tc_empty__"
+	// metaKeyRoot 表示内部元信息 Redis key 根前缀，保持短前缀并与默认业务前缀 tc: 区分。
+	metaKeyRoot = "tcm"
 )
 
 var (
@@ -2070,23 +2072,49 @@ func (m *Manager) prefixDeleteEpochKey(prefix string) string {
 	return tablecacheMetaKey("delete:prefix_epoch", prefix)
 }
 
-// tablecacheMetaKey 生成内部元信息 key，并附带 Redis Cluster hash tag。
-// 业务 key 自带合法 {...} tag 时沿用该 tag；否则使用完整业务 key，确保常规 key 的元信息可与业务 key 同槽。
+// tablecacheMetaKey 生成紧凑内部元信息 key，并确保 Redis Cluster 场景下与业务 key 同槽。
+// 业务 key 已带合法 {...} tag 时直接复用；普通 key 放入 hash tag，避免重复拼接完整 key。
 func tablecacheMetaKey(kind string, key string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "unknown"
+	}
 	key = strings.TrimSpace(key)
 	if key == "" {
 		key = "unknown"
 	}
-	return "tablecache:" + kind + ":" + key + ":{" + redisClusterHashTag(key) + "}"
+	if hasRedisClusterHashTag(key) {
+		return metaKeyRoot + ":" + kind + ":" + key
+	}
+	return metaKeyRoot + ":" + kind + ":{" + key + "}"
 }
 
-// tablecacheMetaKeyPattern 返回前缀清理元信息时使用的 pattern；hash tag 位于 key 后缀，因此这里按 key 前缀匹配。
+// tablecacheMetaKeyPattern 返回前缀清理元信息时使用的 pattern。
 func tablecacheMetaKeyPattern(kind string, prefix string) string {
+	kind = strings.TrimSpace(kind)
+	if kind == "" {
+		kind = "unknown"
+	}
 	prefix = strings.TrimSpace(prefix)
 	if prefix == "" {
 		prefix = "unknown"
 	}
-	return "tablecache:" + kind + ":" + prefix + "*"
+	if hasRedisClusterHashTag(prefix) {
+		return metaKeyRoot + ":" + kind + ":" + prefix + "*"
+	}
+	// 普通 key 的元信息形如 tcm:{kind}:{prefix...}，pattern 保留左花括号即可匹配整段前缀。
+	return metaKeyRoot + ":" + kind + ":{" + prefix + "*"
+}
+
+// hasRedisClusterHashTag 判断 key 是否已经包含合法 Redis Cluster hash tag。
+func hasRedisClusterHashTag(key string) bool {
+	key = strings.TrimSpace(key)
+	start := strings.IndexByte(key, '{')
+	if start < 0 {
+		return false
+	}
+	end := strings.IndexByte(key[start+1:], '}')
+	return end > 0
 }
 
 // redisClusterHashTag 返回 Redis Cluster 对 key 实际使用的 hash tag；无显式 tag 时使用完整 key。

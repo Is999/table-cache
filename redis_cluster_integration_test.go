@@ -58,7 +58,7 @@ func TestRedisSingleIntegration(t *testing.T) {
 	prefix := fmt.Sprintf("itc:single:%d:", time.Now().UnixNano())
 	t.Cleanup(func() {
 		_, _ = store.DeletePattern(context.Background(), prefix+"*", defaultScanCount)
-		_, _ = store.DeletePattern(context.Background(), "tablecache:*"+prefix+"*", defaultScanCount)
+		_, _ = store.DeletePattern(context.Background(), metaKeyRoot+":*"+prefix+"*", defaultScanCount)
 	})
 
 	t.Run("store write and pattern delete", func(t *testing.T) {
@@ -135,7 +135,7 @@ func TestRedisClusterIntegration(t *testing.T) {
 	prefix := fmt.Sprintf("itc:cluster:%d:", time.Now().UnixNano())
 	t.Cleanup(func() {
 		_, _ = store.DeletePattern(context.Background(), prefix+"*", defaultScanCount)
-		_, _ = store.DeletePattern(context.Background(), "tablecache:*"+prefix+"*", defaultScanCount)
+		_, _ = store.DeletePattern(context.Background(), metaKeyRoot+":*"+prefix+"*", defaultScanCount)
 		_ = store.Delete(context.Background(), prefix+"lock")
 	})
 
