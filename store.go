@@ -5,33 +5,36 @@ import (
 	"time"
 )
 
-// Store 定义缓存写入与分布式锁能力，业务框架只要实现该接口即可复用 Manager。
+// Store 定义 Manager 依赖的读取、批量变更和分布式锁契约。
 type Store interface {
-	// Delete 删除一个或多个缓存 key。
-	Delete(ctx context.Context, keys ...string) error
-	// DeletePattern 按 pattern 增量删除匹配 key，避免 KEYS 阻塞线上 Redis。
-	DeletePattern(ctx context.Context, pattern string, count int64) (int64, error)
+	// AcquireRefreshLock 原子获取刷新锁；竞争失败时同时返回当前 owner。
+	AcquireRefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (locked bool, owner string, err error)
+	// ApplyMutation 按故障安全顺序提交一次缓存变更。
+	ApplyMutation(ctx context.Context, mutation StoreMutation) error
 	// Exists 判断指定 key 是否存在。
 	Exists(ctx context.Context, key string) (bool, error)
+	// ExistsMulti 批量判断 key 是否存在，返回 map[key]exists。
+	ExistsMulti(ctx context.Context, keys ...string) (map[string]bool, error)
 	// Read 按缓存类型读取 Redis 原始值。
 	Read(ctx context.Context, key string, typ CacheType) (any, error)
 	// RefreshLock 仅当锁值与持有者标识一致时续期锁。
 	RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error)
 	// ReleaseLock 仅当锁值与持有者标识一致时释放锁，避免误删其它实例刚抢到的锁。
 	ReleaseLock(ctx context.Context, key string, value string) (bool, error)
-	// SetNX 设置 Redis 分布式轻量锁。
-	SetNX(ctx context.Context, key string, value any, ttl time.Duration) (bool, error)
-	// Write 写入单条缓存数据。
-	Write(ctx context.Context, entry Entry) error
-	// WriteBatch 批量写入缓存数据。
-	WriteBatch(ctx context.Context, entries []Entry) error
 }
 
-// ExistsMultiStore 表示可选的批量 Exists 能力。
-// Manager 在等待其它实例重建时会优先使用该能力，以减少多次 Exists 带来的网络往返。
-type ExistsMultiStore interface {
-	// ExistsMulti 批量判断 key 是否存在，返回 map[key]exists。
-	ExistsMulti(ctx context.Context, keys ...string) (map[string]bool, error)
+// StoreValidator 定义 table-cache 构造期专用校验能力，避免碰撞自定义 Store 的通用 Validate 方法。
+type StoreValidator interface {
+	// ValidateTablecacheStore 校验 Store 配置能否安全服务 table-cache。
+	ValidateTablecacheStore() error
+}
+
+// refreshSnapshot 保存 RedisStore 的一次读穿快照；handled=false 时 Manager 使用通用 Store 回退路径。
+type refreshSnapshot struct {
+	Value       any    // Value 是已命中的业务原始值
+	ValueReady  bool   // ValueReady 表示业务值完整命中
+	Result      string // Result 是读取业务值前观察到的完成代际
+	ResultReady bool   // ResultReady 表示完成代际存在
 }
 
 // CollectionPageStore 表示可选的集合分页读取能力。
@@ -41,37 +44,91 @@ type CollectionPageStore interface {
 	ReadPage(ctx context.Context, key string, typ CacheType, options ReadPageOptions) (ReadPageResult, error)
 }
 
-// PrefixIndexStore 定义前缀目标的 key 索引能力，用于大 keyspace 下绕开全库 SCAN。
-// RedisStore 默认实现该接口；自定义 Store 未实现时 Manager 会自动降级为 DeletePattern 扫描删除。
-type PrefixIndexStore interface {
-	// AddPrefixIndexKeys 把一批业务或元信息 key 写入指定前缀索引，并按 ttl 刷新索引过期时间。
-	AddPrefixIndexKeys(ctx context.Context, indexKey string, ttl time.Duration, keys ...string) error
-	// RemovePrefixIndexKeys 从指定前缀索引移除一批 key，用于精确删除或状态切换后清理过期成员。
-	RemovePrefixIndexKeys(ctx context.Context, indexKey string, keys ...string) error
-	// DeletePrefixIndexKeys 分批遍历索引集合中的成员 key，删除真实 Redis key 并清空索引集合。
-	DeletePrefixIndexKeys(ctx context.Context, indexKey string, count int64) (int64, error)
+// HashFieldsStore 定义带锁删除部分 Hash 字段的能力。
+// RedisStore 默认实现该接口；fields 回源为空时必须删除请求范围内的旧值，不能把过期字段继续当成命中。
+type HashFieldsStore interface {
+	// DeleteHashFields 仅在全部 guard 仍归当前请求持有时删除指定 Hash 字段，并清除该 Hash 的字段空值 registry。
+	DeleteHashFields(ctx context.Context, guards []LockGuard, key string, registryKey string, fields []string) error
 }
 
-// MutationStore 定义合并缓存变更能力，用于把删除、写入和索引维护压缩进更少的 Redis Pipeline。
-// RedisStore 默认实现该接口；自定义 Store 未实现时 Manager 会拆回基础 Store 与 PrefixIndexStore 调用。
-type MutationStore interface {
-	// ApplyMutation 按顺序提交一次缓存变更描述；实现方应先删除旧 key，再写入新 key，最后维护索引。
-	ApplyMutation(ctx context.Context, mutation StoreMutation) error
+// PrefixIndexStore 定义按前缀安全超集索引删除的能力，用于大 keyspace 下绕开全库 SCAN。
+// RedisStore 默认实现该接口；自定义 Store 未实现时，Manager 仅可通过 GuardedPatternStore 执行带锁 guard 的 SCAN 降级。
+type PrefixIndexStore interface {
+	// DeletePrefixIndexKeys 分批遍历安全超集索引并删除真实 Redis key，索引成员在线保留。
+	DeletePrefixIndexKeys(ctx context.Context, indexKey string, count int64, guards []LockGuard) (int64, error)
+}
+
+// PrefixReplaceStore 定义前缀目标的安全全量替换能力。
+// 实现必须先完整校验并写入新数据，再删除不在 KeepKeys 中的旧数据；失败时允许保留冗余数据，但不能先清空旧前缀。
+type PrefixReplaceStore interface {
+	// ReplacePrefix 写入当前快照并删除旧快照中的过期 key，返回实际删除数量。
+	ReplacePrefix(ctx context.Context, mutation PrefixReplaceMutation) (int64, error)
+}
+
+// PrefixReplaceMutation 描述一次前缀全量快照替换。
+type PrefixReplaceMutation struct {
+	Guards         []LockGuard   // Guards 是每批真实写删必须原子校验的锁 owner
+	Prefix         string        // Prefix 是全量替换的业务前缀，用于校验分布式 Redis 的同槽约束
+	Entries        []Entry       // Entries 是本次快照需要写入的业务或元信息条目
+	KeepKeys       []string      // KeepKeys 是替换成功后必须保留的真实 Redis key，通常覆盖 Entries 及本轮保留元信息
+	DeletePatterns []string      // DeletePatterns 是旧索引不可信时用于枚举旧 key 的已转义 Redis glob pattern
+	IndexKey       string        // IndexKey 是前缀目标的索引 manifest key
+	ReadyKey       string        // ReadyKey 是当前索引可信标记，只用于选择索引或 SCAN 枚举路径
+	IndexTTL       time.Duration // IndexTTL 是索引可信窗口，分片成员会保留更长的安全窗口
+	ScanCount      int64         // ScanCount 是索引或 keyspace 分页枚举的单批建议数量
+}
+
+// MarkerReplaceStore 定义 String marker 与旧缓存的一致切换能力。
+type MarkerReplaceStore interface {
+	// ReplaceWithMarker 先写入 marker，成功后再删除同槽旧 key。
+	ReplaceWithMarker(ctx context.Context, guards []LockGuard, marker Entry, deleteKeys ...string) error
+}
+
+// FieldsEmptyStore 定义 Hash 字段组合空值的有界 registry 能力。
+type FieldsEmptyStore interface {
+	// ReplaceFieldsWithEmpty 删除请求字段并按独立 TTL 登记字段组合为空。
+	ReplaceFieldsWithEmpty(ctx context.Context, guards []LockGuard, key string, registryKey string, fieldsID string, fields []string, ttl time.Duration) error
+	// HasFieldsEmpty 判断字段组合是否仍在有效期内。
+	HasFieldsEmpty(ctx context.Context, registryKey string, fieldsID string) (bool, error)
+}
+
+// GuardedPatternStore 定义带锁 owner 原子校验的 SCAN 删除能力。
+type GuardedPatternStore interface {
+	// DeletePatternGuarded 仅在全部 guard 仍归当前请求持有时删除每批匹配 key。
+	DeletePatternGuarded(ctx context.Context, pattern string, count int64, guards []LockGuard) (int64, error)
+}
+
+// PrefixMutationValidator 在回源前校验前缀全量写删能否安全执行。
+type PrefixMutationValidator interface {
+	// ValidatePrefixMutation 拒绝无法与前缀锁原子提交的分布式跨槽前缀。
+	ValidatePrefixMutation(ctx context.Context, prefix string) error
+}
+
+// PrefixMutationTopologyStore 暴露无需网络探测的前缀原子提交拓扑能力。
+type PrefixMutationTopologyStore interface {
+	// AllowsPrefixMutation 表示当前部署能否安全执行该前缀的全量写删与索引维护。
+	AllowsPrefixMutation(prefix string) bool
+}
+
+// LockGuard 表示一次 Redis 提交必须仍持有的分布式锁 owner。
+type LockGuard struct {
+	Key   string // Key 是刷新锁 Redis key
+	Owner string // Owner 是抢锁前生成且仅当前请求持有的随机标识
 }
 
 // StoreMutation 描述一次缓存刷新或清理需要提交到底层 Store 的变更集合。
 type StoreMutation struct {
+	Guards       []LockGuard           // Guards 是业务写删同一原子边界内必须校验的锁 owner
 	DeleteKeys   []string              // DeleteKeys 是需要删除的真实 Redis key 列表，来源于旧业务 key、空值元信息或重建结果元信息
 	WriteEntries []Entry               // WriteEntries 是需要写入的缓存条目，来源于 Loader 结果或内部元信息
 	AddIndex     []PrefixIndexMutation // AddIndex 表示需要把哪些 key 加入前缀索引集合，通常来源于写入成功的业务 key 或元信息 key
-	RemoveIndex  []PrefixIndexMutation // RemoveIndex 表示需要从前缀索引集合移除哪些 key，通常来源于被删除或状态切换的旧 key
 }
 
 // PrefixIndexMutation 描述一次前缀索引集合的成员变更。
 type PrefixIndexMutation struct {
 	IndexKey string        // IndexKey 是前缀目标对应的索引集合 Redis key
-	TTL      time.Duration // TTL 是索引集合需要刷新的保留时间；移除成员时可为 0
-	Keys     []string      // Keys 是需要加入或移除索引集合的真实 Redis key 成员列表
+	TTL      time.Duration // TTL 是安全超集索引加入成员时刷新的有效保留时间，由 Store 校验
+	Keys     []string      // Keys 是需要加入索引集合的真实 Redis key 成员列表
 }
 
 // Metrics 定义 tablecache 运行指标记录接口，可由 Prometheus、StatsD 或自定义埋点实现。
@@ -128,17 +185,13 @@ type ScanFallbackMetrics interface {
 	RecordScanFallback(ctx context.Context, index string, prefix string)
 }
 
-// Logger 定义可选日志接口，兼容传统 printf 风格日志实现。
-// 若业务已统一使用 go-utils.Logger，也可直接通过 WithLogger 传入。
+// Logger 定义可选的 printf 风格日志接口。
+// go-utils.Logger 应通过 WithGoUtilsLogger 接入。
 type Logger interface {
-	// Debugf 输出调试日志。
-	Debugf(format string, args ...any)
 	// Infof 输出信息日志。
 	Infof(format string, args ...any)
 	// Warnf 输出警告日志。
 	Warnf(format string, args ...any)
-	// Errorf 输出错误日志。
-	Errorf(format string, args ...any)
 }
 
 // Encoder 定义复杂缓存值的序列化函数，默认使用 encoding/json。

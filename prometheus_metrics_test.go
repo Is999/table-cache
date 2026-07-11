@@ -2,12 +2,51 @@ package tablecache
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 )
+
+// TestNewPrometheusMetricsRejectsInvalidBuckets 验证非法桶在构造期返回错误而不是在记录指标时 panic。
+func TestNewPrometheusMetricsRejectsInvalidBuckets(t *testing.T) {
+	tests := []struct {
+		name string
+		opt  PrometheusMetricsOption
+	}{
+		{name: "refresh duplicate", opt: WithPrometheusRefreshBuckets([]float64{0.1, 0.1})},
+		{name: "refresh descending", opt: WithPrometheusRefreshBuckets([]float64{1, 0.5})},
+		{name: "refresh nan", opt: WithPrometheusRefreshBuckets([]float64{0.1, math.NaN()})},
+		{name: "entry duplicate", opt: WithPrometheusRefreshEntryBuckets([]float64{1, 1})},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			metrics, err := NewPrometheusMetrics(
+				WithPrometheusRegisterer(prometheus.NewRegistry()),
+				test.opt,
+			)
+			if err == nil || metrics != nil {
+				t.Fatalf("NewPrometheusMetrics() = (%v, %v), want nil metrics and validation error", metrics, err)
+			}
+		})
+	}
+}
+
+// TestNewPrometheusMetricsCopiesBuckets 验证调用方后续修改切片不会破坏延迟创建的 Histogram。
+func TestNewPrometheusMetricsCopiesBuckets(t *testing.T) {
+	buckets := []float64{0.1, 0.5, 1}
+	metrics, err := NewPrometheusMetrics(
+		WithPrometheusRegisterer(prometheus.NewRegistry()),
+		WithPrometheusRefreshBuckets(buckets),
+	)
+	if err != nil {
+		t.Fatalf("NewPrometheusMetrics() error = %v", err)
+	}
+	buckets[1] = 0.05
+	metrics.RecordRefresh(context.Background(), "user", "success", 100*time.Millisecond)
+}
 
 // TestPrometheusMetricsRecord 验证 Prometheus 指标适配器可完整记录基础、扩展和读取链路指标。
 func TestPrometheusMetricsRecord(t *testing.T) {

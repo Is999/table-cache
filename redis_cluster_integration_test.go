@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -30,9 +31,64 @@ type singleIntegrationConfig struct {
 	PoolSize int    // PoolSize 是连接池大小
 }
 
-// clusterSlotsCompatTestClient 表示测试里兼容读取旧版 ClusterSlots 的最小客户端能力。
-type clusterSlotsCompatTestClient interface {
+// clusterSlotsTestClient 表示测试里执行 CLUSTER SLOTS 的最小客户端能力。
+type clusterSlotsTestClient interface {
 	ClusterSlots(ctx context.Context) *redis.ClusterSlotsCmd
+}
+
+// integrationClientCloser 表示真实 Redis 测试结束时需要关闭的客户端。
+type integrationClientCloser interface {
+	Close() error
+}
+
+// integrationCleanupStore 暴露集成测试清理所需的底层 Redis 原语，不扩大 Manager 的 Store 契约。
+type integrationCleanupStore interface {
+	Store
+	deleteKeys(ctx context.Context, keys ...string) error
+	deletePattern(ctx context.Context, pattern string, count int64) (int64, error)
+}
+
+// allPrefixIndexShards 返回集成测试清理所需的全部索引分片。
+func allPrefixIndexShards() []int {
+	shards := make([]int, prefixIndexShardCount)
+	for shard := range shards {
+		shards[shard] = shard
+	}
+	return shards
+}
+
+// registerRedisIntegrationCleanup 保证先清理测试 key，再关闭 Redis 客户端，并让清理错误在测试结果中可见。
+func registerRedisIntegrationCleanup(t *testing.T, store integrationCleanupStore, client integrationClientCloser, prefix string) {
+	t.Helper()
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		patterns := []string{
+			prefix + "*",
+			metaKeyRoot + ":*" + prefix + "*",
+		}
+		for _, pattern := range patterns {
+			if _, err := store.deletePattern(cleanupCtx, pattern, defaultScanCount); err != nil {
+				t.Errorf("integration cleanup pattern %q error = %v", pattern, err)
+			}
+		}
+		indexKey := metaKeyRoot + ":pidx:" + prefix
+		readyKey := metaKeyRoot + ":pidx:ready:" + prefix
+		if hasRedisClusterHashTag(prefix) {
+			indexKey = tablecacheMetaKey("pidx", prefix)
+			readyKey = tablecacheMetaKey("pidx:ready", prefix)
+		}
+		indexKeys := []string{indexKey, prefixIndexActiveKey(indexKey), readyKey}
+		for _, shard := range allPrefixIndexShards() {
+			indexKeys = append(indexKeys, prefixIndexShardKey(indexKey, shard))
+		}
+		if err := store.deleteKeys(cleanupCtx, indexKeys...); err != nil {
+			t.Errorf("integration cleanup prefix index error = %v", err)
+		}
+		if err := client.Close(); err != nil {
+			t.Errorf("integration redis close error = %v", err)
+		}
+	})
 }
 
 // TestRedisSingleIntegration 验证真实单机 Redis 环境下的关键缓存能力。
@@ -53,16 +109,12 @@ func TestRedisSingleIntegration(t *testing.T) {
 		_ = client.Close()
 		t.Fatalf("single redis ping error = %v", err)
 	}
-	defer client.Close()
 	store := NewRedisStore(client)
 	prefix := fmt.Sprintf("itc:single:%d:", time.Now().UnixNano())
-	t.Cleanup(func() {
-		_, _ = store.DeletePattern(context.Background(), prefix+"*", defaultScanCount)
-		_, _ = store.DeletePattern(context.Background(), metaKeyRoot+":*"+prefix+"*", defaultScanCount)
-	})
+	registerRedisIntegrationCleanup(t, store, client, prefix)
 
 	t.Run("store write and pattern delete", func(t *testing.T) {
-		err := store.WriteBatch(ctx, []Entry{
+		err := store.writeBatch(ctx, []Entry{
 			{Key: prefix + "string", Type: TypeString, Value: "ok"},
 			{Key: prefix + "hash", Type: TypeHash, Value: map[string]any{"name": "alpha"}},
 			{Key: prefix + "list", Type: TypeList, Value: []string{"a", "b"}},
@@ -70,7 +122,7 @@ func TestRedisSingleIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBatch() error = %v", err)
 		}
-		deleted, err := store.DeletePattern(ctx, prefix+"*", defaultScanCount)
+		deleted, err := store.deletePattern(ctx, prefix+"*", defaultScanCount)
 		if err != nil {
 			t.Fatalf("DeletePattern() error = %v", err)
 		}
@@ -80,40 +132,41 @@ func TestRedisSingleIntegration(t *testing.T) {
 	})
 
 	t.Run("manager load through and delete guard", func(t *testing.T) {
+		managedPrefix := prefix + "managed:"
 		manager, err := NewManager(store, []Target{
 			{
 				Index: "single_itc",
 				Title: "单机集成测试缓存",
-				Key:   prefix,
+				Key:   "managed:",
 				Type:  TypeString,
 				Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "value:" + params.Key}}, nil
 				},
 			},
-		}, WithKeyPrefix(""))
+		}, WithKeyPrefix(prefix), WithScanFallback(true))
 		if err != nil {
 			t.Fatalf("NewManager() error = %v", err)
 		}
 		var value string
-		result, err := manager.LoadThrough(ctx, prefix+"1", &value, nil)
+		result, err := manager.LoadThrough(ctx, managedPrefix+"1", &value, nil)
 		if err != nil {
 			t.Fatalf("LoadThrough() error = %v", err)
 		}
-		if result.State != LookupStateHit || !result.Refreshed || value != "value:"+prefix+"1" {
+		if result.State != LookupStateHit || !result.Refreshed || value != "value:"+managedPrefix+"1" {
 			t.Fatalf("LoadThrough() result=%+v value=%q, want refreshed hit/value", result, value)
 		}
-		if err := manager.DeleteByKey(ctx, "other:1"); err == nil || !errors.Is(err, ErrTargetNotFound) {
-			t.Fatalf("DeleteByKey(other:1) error = %v, want ErrTargetNotFound", err)
+		if err := manager.DeleteByKey(ctx, prefix+"other:1"); err == nil || !errors.Is(err, ErrTargetNotFound) {
+			t.Fatalf("DeleteByKey(prefixed other:1) error = %v, want ErrTargetNotFound", err)
 		}
-		if err := manager.DeleteByPrefix(ctx, prefix); err != nil {
+		if err := manager.DeleteByPrefix(ctx, managedPrefix); err != nil {
 			t.Fatalf("DeleteByPrefix() error = %v", err)
 		}
-		exists, err := client.Exists(ctx, prefix+"1").Result()
+		exists, err := client.Exists(ctx, managedPrefix+"1").Result()
 		if err != nil {
-			t.Fatalf("Exists(%s) error = %v", prefix+"1", err)
+			t.Fatalf("Exists(%s) error = %v", managedPrefix+"1", err)
 		}
 		if exists != 0 {
-			t.Fatalf("%s exists = %d, want 0", prefix+"1", exists)
+			t.Fatalf("%s exists = %d, want 0", managedPrefix+"1", exists)
 		}
 	})
 }
@@ -130,14 +183,9 @@ func TestRedisClusterIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newClusterIntegrationClient() error = %v", err)
 	}
-	defer client.Close()
 	store := NewRedisStore(client)
 	prefix := fmt.Sprintf("itc:cluster:%d:", time.Now().UnixNano())
-	t.Cleanup(func() {
-		_, _ = store.DeletePattern(context.Background(), prefix+"*", defaultScanCount)
-		_, _ = store.DeletePattern(context.Background(), metaKeyRoot+":*"+prefix+"*", defaultScanCount)
-		_ = store.Delete(context.Background(), prefix+"lock")
-	})
+	registerRedisIntegrationCleanup(t, store, client, prefix)
 
 	t.Run("ping and slots", func(t *testing.T) {
 		if err := client.Ping(ctx).Err(); err != nil {
@@ -152,13 +200,49 @@ func TestRedisClusterIntegration(t *testing.T) {
 		}
 	})
 
-	t.Run("store lock and pattern delete", func(t *testing.T) {
-		locked, err := store.SetNX(ctx, prefix+"lock", "owner-1", time.Minute)
+	t.Run("single client cluster seed fails closed", func(t *testing.T) {
+		seedClient := redis.NewClient(&redis.Options{
+			Addr:     config.Addrs[0],
+			Password: config.Password,
+			PoolSize: config.PoolSize,
+		})
+		t.Cleanup(func() { _ = seedClient.Close() })
+		seedStore := NewRedisStore(seedClient)
+		miswiredPrefix := prefix + "miswired:"
+		if err := seedStore.ValidatePrefixMutation(ctx, miswiredPrefix); !errors.Is(err, ErrRedisTopologyUnsupported) {
+			t.Fatalf("ValidatePrefixMutation() error = %v, want ErrRedisTopologyUnsupported", err)
+		}
+		if _, err := seedStore.deletePattern(ctx, RedisPrefixPattern(miswiredPrefix), defaultScanCount); !errors.Is(err, ErrRedisTopologyUnsupported) {
+			t.Fatalf("deletePattern() error = %v, want ErrRedisTopologyUnsupported", err)
+		}
+		var loaderCalls atomic.Int64
+		manager, err := NewManager(seedStore, []Target{{
+			Index: "cluster_seed_miswired",
+			Key:   "miswired:",
+			Type:  TypeString,
+			Loader: func(context.Context, LoadParams) ([]Entry, error) {
+				loaderCalls.Add(1)
+				return nil, nil
+			},
+		}}, WithKeyPrefix(prefix))
 		if err != nil {
-			t.Fatalf("SetNX() error = %v", err)
+			t.Fatalf("NewManager() error = %v", err)
+		}
+		if err := manager.RefreshByKey(ctx, miswiredPrefix); !errors.Is(err, ErrRedisTopologyUnsupported) {
+			t.Fatalf("RefreshByKey(full) error = %v, want ErrRedisTopologyUnsupported", err)
+		}
+		if loaderCalls.Load() != 0 {
+			t.Fatalf("loader calls = %d, want 0", loaderCalls.Load())
+		}
+	})
+
+	t.Run("store lock and pattern delete", func(t *testing.T) {
+		locked, _, err := store.AcquireRefreshLock(ctx, prefix+"lock", "owner-1", time.Minute)
+		if err != nil {
+			t.Fatalf("AcquireRefreshLock() error = %v", err)
 		}
 		if !locked {
-			t.Fatalf("SetNX() locked = false, want true")
+			t.Fatalf("AcquireRefreshLock() locked = false, want true")
 		}
 		ok, err := store.RefreshLock(ctx, prefix+"lock", "owner-1", 2*time.Minute)
 		if err != nil {
@@ -174,7 +258,7 @@ func TestRedisClusterIntegration(t *testing.T) {
 		if !released {
 			t.Fatalf("ReleaseLock() released = false, want true")
 		}
-		err = store.WriteBatch(ctx, []Entry{
+		err = store.writeBatch(ctx, []Entry{
 			{Key: prefix + "string", Type: TypeString, Value: "ok"},
 			{Key: prefix + "hash", Type: TypeHash, Value: map[string]any{"name": "alpha"}},
 			{Key: prefix + "set", Type: TypeSet, Value: []any{"a", "b"}},
@@ -182,7 +266,7 @@ func TestRedisClusterIntegration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("WriteBatch() error = %v", err)
 		}
-		deleted, err := store.DeletePattern(ctx, prefix+"*", defaultScanCount)
+		deleted, err := store.deletePattern(ctx, prefix+"*", defaultScanCount)
 		if err != nil {
 			t.Fatalf("DeletePattern() error = %v", err)
 		}
@@ -191,28 +275,72 @@ func TestRedisClusterIntegration(t *testing.T) {
 		}
 	})
 
+	t.Run("manager untagged hash fields", func(t *testing.T) {
+		fieldsPrefix := prefix + "fields:"
+		manager, err := NewManager(store, []Target{{
+			Index:            "cluster_fields_itc",
+			Title:            "集群Hash字段刷新测试缓存",
+			Key:              "fields:",
+			Type:             TypeHash,
+			AllowEmptyMarker: true,
+			Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
+				if strings.HasSuffix(params.Key, "empty") {
+					return nil, errors.Tag(ErrNotFound)
+				}
+				return []Entry{{
+					Key: params.Key, Type: TypeHash,
+					Value: map[string]any{"name": "cluster"}, Overwrite: Bool(false),
+				}}, nil
+			},
+		}}, WithKeyPrefix(prefix), WithWait(50*time.Millisecond, 20))
+		if err != nil {
+			t.Fatalf("NewManager(fields) error = %v", err)
+		}
+		key := fieldsPrefix + "1"
+		var value map[string]string
+		result, err := manager.GetOrRefreshWithOptions(ctx, key, &value, LoadThroughOptions{Fields: []string{"name"}})
+		if err != nil {
+			t.Fatalf("GetOrRefreshWithOptions(fields) error = %v", err)
+		}
+		if result.State != LookupStateHit || !result.Refreshed || value["name"] != "cluster" {
+			t.Fatalf("fields result=%+v value=%v, want refreshed hit", result, value)
+		}
+		value = nil
+		result, err = manager.GetOrRefreshWithOptions(ctx, key, &value, LoadThroughOptions{Fields: []string{"name"}})
+		if err != nil || result.State != LookupStateHit || result.Refreshed || value["name"] != "cluster" {
+			t.Fatalf("fields cached result=%+v value=%v err=%v", result, value, err)
+		}
+		emptyKey := fieldsPrefix + "empty"
+		result, err = manager.GetOrRefreshWithOptions(ctx, emptyKey, &value, LoadThroughOptions{Fields: []string{"name"}})
+		if err != nil || result.State != LookupStateEmpty || !result.Refreshed {
+			t.Fatalf("fields empty result=%+v err=%v", result, err)
+		}
+	})
+
 	t.Run("manager prefix index delete", func(t *testing.T) {
+		indexedPrefix := prefix + "{indexed}:"
 		manager, err := NewManager(store, []Target{
 			{
 				Index: "cluster_index_itc",
 				Title: "集群索引删除测试缓存",
-				Key:   prefix,
+				Key:   "{indexed}:",
 				Type:  TypeString,
 				Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 					return []Entry{
-						{Key: prefix + "indexed:1", Type: TypeString, Value: "one"},
-						{Key: prefix + "indexed:2", Type: TypeString, Value: "two"},
+						{Key: params.Target.Key + "1", Type: TypeString, Value: "one"},
+						{Key: params.Target.Key + "2", Type: TypeString, Value: "two"},
 					}, nil
 				},
 			},
-		}, WithKeyPrefix(""), WithPrefixKeyIndexTTL(time.Hour))
+		}, WithKeyPrefix(prefix), WithPrefixKeyIndexTTL(time.Hour))
 		if err != nil {
 			t.Fatalf("NewManager(index) error = %v", err)
 		}
-		if err := manager.RefreshByKey(ctx, prefix); err != nil {
+		if err := manager.RefreshByKey(ctx, indexedPrefix); err != nil {
 			t.Fatalf("RefreshByKey(prefix) error = %v", err)
 		}
-		target := manager.prefixTargetsM[prefix]        // target 表示当前集群集成测试的前缀目标，用于定位内部索引可信标记
+		target := manager.prefixTargetsM[indexedPrefix] // target 表示当前集群集成测试的前缀目标，用于定位内部索引可信标记
+		indexKey := manager.prefixIndexKey(target)
 		readyKey := manager.prefixIndexReadyKey(target) // readyKey 存在说明索引已覆盖一次完整全量刷新，DeleteByPrefix 会走索引快路径
 		exists, err := client.Exists(ctx, readyKey).Result()
 		if err != nil {
@@ -221,10 +349,10 @@ func TestRedisClusterIntegration(t *testing.T) {
 		if exists != 1 {
 			t.Fatalf("prefix index ready exists = %d, want 1", exists)
 		}
-		if err := manager.DeleteByPrefix(ctx, prefix); err != nil {
+		if err := manager.DeleteByPrefix(ctx, indexedPrefix); err != nil {
 			t.Fatalf("DeleteByPrefix(indexed prefix) error = %v", err)
 		}
-		for _, key := range []string{prefix + "indexed:1", prefix + "indexed:2", readyKey} {
+		for _, key := range []string{indexedPrefix + "1", indexedPrefix + "2"} {
 			exists, err := client.Exists(ctx, key).Result()
 			if err != nil {
 				t.Fatalf("Exists(%s) error = %v", key, err)
@@ -233,44 +361,56 @@ func TestRedisClusterIntegration(t *testing.T) {
 				t.Fatalf("key %s exists = %d, want 0", key, exists)
 			}
 		}
+		if exists, err := client.Exists(ctx, readyKey, indexKey).Result(); err != nil || exists != 2 {
+			t.Fatalf("safe superset ready/index exists = %d error=%v, want 2,nil", exists, err)
+		}
 	})
 
 	t.Run("manager registered key guard", func(t *testing.T) {
+		managedPrefix := prefix + "managed:"
 		manager, err := NewManager(store, []Target{
 			{
 				Index: "cluster_itc",
 				Title: "集群集成测试缓存",
-				Key:   prefix,
+				Key:   "managed:",
 				Type:  TypeString,
 				Loader: func(ctx context.Context, params LoadParams) ([]Entry, error) {
 					return []Entry{{Key: params.Key, Type: TypeString, Value: "value:" + params.Key}}, nil
 				},
 			},
-		}, WithKeyPrefix(""), WithWait(50*time.Millisecond, 20))
+		}, WithKeyPrefix(prefix), WithWait(50*time.Millisecond, 20))
 		if err != nil {
 			t.Fatalf("NewManager() error = %v", err)
 		}
-		if err := manager.RefreshByKey(ctx, prefix+"1"); err != nil {
+		if err := manager.RefreshByKey(ctx, managedPrefix+"1"); err != nil {
 			t.Fatalf("RefreshByKey() error = %v", err)
 		}
 		var value string
-		result, err := manager.GetState(ctx, prefix+"1", &value)
+		result, err := manager.GetState(ctx, managedPrefix+"1", &value)
 		if err != nil {
 			t.Fatalf("GetState() error = %v", err)
 		}
-		if result.State != LookupStateHit || value != "value:"+prefix+"1" {
+		if result.State != LookupStateHit || value != "value:"+managedPrefix+"1" {
 			t.Fatalf("GetState() result=%+v value=%q, want hit/value", result, value)
 		}
-		if err := manager.RefreshByKeys(ctx, []string{prefix + "2", prefix + "3", prefix + "2"}); err != nil {
+		if err := manager.RefreshByKeys(ctx, []string{managedPrefix + "2", managedPrefix + "3", managedPrefix + "2"}); err != nil {
 			t.Fatalf("RefreshByKeys() error = %v", err)
 		}
-		if err := manager.DeleteByKey(ctx, "other:1"); err == nil || !errors.Is(err, ErrTargetNotFound) {
-			t.Fatalf("DeleteByKey(other:1) error = %v, want ErrTargetNotFound", err)
+		if err := manager.DeleteByKey(ctx, prefix+"other:1"); err == nil || !errors.Is(err, ErrTargetNotFound) {
+			t.Fatalf("DeleteByKey(prefixed other:1) error = %v, want ErrTargetNotFound", err)
 		}
-		if err := manager.DeleteByPrefix(ctx, prefix); err != nil {
-			t.Fatalf("DeleteByPrefix() error = %v", err)
+		if err := manager.RefreshByKey(ctx, managedPrefix); !errors.Is(err, ErrDistributedPrefixHashTagRequired) {
+			t.Fatalf("RefreshByKey(full) error = %v, want ErrDistributedPrefixHashTagRequired", err)
 		}
-		for _, key := range []string{prefix + "1", prefix + "2", prefix + "3"} {
+		if err := manager.DeleteByPrefix(ctx, managedPrefix); !errors.Is(err, ErrDistributedPrefixHashTagRequired) {
+			t.Fatalf("DeleteByPrefix() error = %v, want ErrDistributedPrefixHashTagRequired", err)
+		}
+		for _, key := range []string{managedPrefix + "1", managedPrefix + "2", managedPrefix + "3"} {
+			if err := manager.DeleteByKey(ctx, key); err != nil {
+				t.Fatalf("DeleteByKey(%s) error = %v", key, err)
+			}
+		}
+		for _, key := range []string{managedPrefix + "1", managedPrefix + "2", managedPrefix + "3"} {
 			exists, err := client.Exists(ctx, key).Result()
 			if err != nil {
 				t.Fatalf("Exists(%s) error = %v", key, err)
@@ -330,7 +470,7 @@ func newClusterIntegrationClient(ctx context.Context, config clusterIntegrationC
 }
 
 // loadRewrittenClusterSlots 从可访问的种子节点读取槽位信息，并按 addr_map 改写容器 hostname。
-// Redis 7 及以上优先使用 ClusterShards；旧版本不支持时自动回退到 ClusterSlots。
+// Redis 7 及以上优先使用 ClusterShards；Redis 6.2 使用 ClusterSlots。
 func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationConfig) ([]redis.ClusterSlot, error) {
 	var lastErr error
 	for _, addr := range config.Addrs {
@@ -338,7 +478,7 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 			Addr:     addr,
 			Password: config.Password,
 		})
-		slots, err := loadClusterSlotsCompatForTest(ctx, seedClient, config.AddrMap)
+		slots, err := loadClusterTopologySlotsForTest(ctx, seedClient, config.AddrMap)
 		_ = seedClient.Close()
 		if err != nil {
 			lastErr = err
@@ -352,8 +492,8 @@ func loadRewrittenClusterSlots(ctx context.Context, config clusterIntegrationCon
 	return nil, errors.Tag(lastErr)
 }
 
-// loadClusterSlotsCompatForTest 优先使用 ClusterShards；若目标 Redis 版本不支持，则自动回退到 ClusterSlots。
-func loadClusterSlotsCompatForTest(ctx context.Context, seedClient *redis.Client, addrMap map[string]string) ([]redis.ClusterSlot, error) {
+// loadClusterTopologySlotsForTest 按 Redis 服务端能力选择 ClusterShards 或 ClusterSlots。
+func loadClusterTopologySlotsForTest(ctx context.Context, seedClient *redis.Client, addrMap map[string]string) ([]redis.ClusterSlot, error) {
 	shards, err := seedClient.ClusterShards(ctx).Result()
 	if err == nil {
 		return clusterShardsToSlotsForTest(shards, addrMap), nil
@@ -361,7 +501,7 @@ func loadClusterSlotsCompatForTest(ctx context.Context, seedClient *redis.Client
 	if !isClusterShardsUnsupportedForTest(err) {
 		return nil, errors.Tag(err)
 	}
-	slots, err := loadLegacyClusterSlotsForTest(ctx, seedClient)
+	slots, err := loadClusterSlotsForTest(ctx, seedClient)
 	if err != nil {
 		return nil, errors.Tag(err)
 	}
@@ -373,8 +513,8 @@ func loadClusterSlotsCompatForTest(ctx context.Context, seedClient *redis.Client
 	return slots, nil
 }
 
-// loadLegacyClusterSlotsForTest 通过旧版 ClusterSlots 命令读取槽位信息，作为 Redis 7 以下版本的兼容回退。
-func loadLegacyClusterSlotsForTest(ctx context.Context, client clusterSlotsCompatTestClient) ([]redis.ClusterSlot, error) {
+// loadClusterSlotsForTest 通过 ClusterSlots 命令读取槽位信息。
+func loadClusterSlotsForTest(ctx context.Context, client clusterSlotsTestClient) ([]redis.ClusterSlot, error) {
 	slots, err := client.ClusterSlots(ctx).Result()
 	return slots, errors.Tag(err)
 }
@@ -446,7 +586,32 @@ func isClusterShardsUnsupportedForTest(err error) bool {
 		return false
 	}
 	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "unknown command") && strings.Contains(message, "cluster") && strings.Contains(message, "shards")
+	if !strings.Contains(message, "shards") {
+		return false
+	}
+	return strings.Contains(message, "unknown command") || strings.Contains(message, "unknown subcommand")
+}
+
+// TestIsClusterShardsUnsupportedForTest 验证 Redis 6.2 与代理层的两类不支持错误都会回退到 ClusterSlots。
+func TestIsClusterShardsUnsupportedForTest(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil"},
+		{name: "redis 6.2", err: errors.New("ERR unknown subcommand 'SHARDS'. Try CLUSTER HELP."), want: true},
+		{name: "proxy", err: errors.New("ERR unknown command 'cluster shards'"), want: true},
+		{name: "other cluster error", err: errors.New("ERR cluster is down")},
+		{name: "other unknown command", err: errors.New("ERR unknown command 'hello'")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isClusterShardsUnsupportedForTest(test.err); got != test.want {
+				t.Fatalf("isClusterShardsUnsupportedForTest(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
 }
 
 // rewriteClusterAddr 按 addr_map 把集群返回的 hostname 改写为宿主机可访问地址。

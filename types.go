@@ -55,8 +55,8 @@ type Loader func(ctx context.Context, params LoadParams) ([]Entry, error)
 type Target struct {
 	Index            string        // Index 是缓存目标索引，通常等于 Redis key 第一个冒号前的前缀
 	Title            string        // Title 是缓存目标中文名称
-	Key              string        // Key 是 Redis key 或 key 前缀，前缀型目标以冒号结尾
-	KeyTitle         string        // KeyTitle 是缓存管理页展示用 key 模板
+	Key              string        // Key 是不含 Manager keyPrefix 的逻辑 key 或前缀，前缀型目标以冒号结尾
+	KeyTitle         string        // KeyTitle 是不含 Manager keyPrefix 的展示模板
 	Type             CacheType     // Type 是 Redis 数据结构类型
 	Remark           string        // Remark 是缓存用途说明
 	TTL              time.Duration // TTL 是业务缓存基础过期时间，0 表示不过期
@@ -65,7 +65,6 @@ type Target struct {
 	LoaderTimeout    time.Duration // LoaderTimeout 是当前目标回源加载超时时间，0 表示使用管理器默认值
 	RefreshAll       bool          // RefreshAll 表示刷新全部缓存时是否包含该目标
 	AllowEmptyMarker bool          // AllowEmptyMarker 表示加载空数据时是否写入空值占位
-	VisibleEmptyMark bool          // VisibleEmptyMark 表示把空值占位直接写入业务 key；默认只写独立元信息
 	Loader           Loader        // Loader 是缓存回源加载器
 }
 
@@ -81,7 +80,7 @@ type LoadParams struct {
 // LookupResult 表示一次缓存读取或“读取后按需刷新”的结果。
 type LookupResult struct {
 	State     LookupState `json:"state"`     // State 是本次读取最终状态
-	Refreshed bool        `json:"refreshed"` // Refreshed 表示本次流程中是否执行了回源刷新
+	Refreshed bool        `json:"refreshed"` // Refreshed 表示本次 miss 是否参与了刷新流程，包括执行、等待或复用同一轮结果
 }
 
 // LoadThroughOptions 表示单次读穿缓存调用的可选参数。
@@ -102,7 +101,7 @@ type LoadThroughItem struct {
 
 // LoadThroughBatchOptions 表示一批读穿请求的批次级配置。
 type LoadThroughBatchOptions struct {
-	Concurrency    int                // Concurrency 是本批次读穿的并发度，0 表示沿用 Manager 默认配置
+	Concurrency    int                // Concurrency 是本批次读穿的并发度，0 表示沿用 Manager 默认配置，有效范围为0到256
 	DefaultOptions LoadThroughOptions // DefaultOptions 是本批次所有条目的默认读穿参数，条目级 Options 优先级更高
 }
 
@@ -137,7 +136,7 @@ type LoadThroughBatchSummary struct {
 	Hit        int      `json:"hit"`        // Hit 是最终命中缓存数据的条数
 	Miss       int      `json:"miss"`       // Miss 是最终仍未命中的条数
 	Empty      int      `json:"empty"`      // Empty 是命中空值占位的条数
-	Refreshed  int      `json:"refreshed"`  // Refreshed 是执行过程中触发回源刷新的条数
+	Refreshed  int      `json:"refreshed"`  // Refreshed 是批次中参与刷新流程的条数
 	FailedKeys []string `json:"failedKeys"` // FailedKeys 是执行失败的 key 列表
 }
 
@@ -237,7 +236,7 @@ type Entry struct {
 	Value     any           // Value 是写入值，类型由 Type 决定
 	TTL       time.Duration // TTL 是当前 key 的基础过期时间
 	Jitter    time.Duration // Jitter 是当前 key 的过期时间抖动范围
-	Overwrite *bool         // Overwrite 控制写入前是否先删除旧 key；nil 表示默认覆盖写入
+	Overwrite *bool         // Overwrite 控制是否覆盖旧值；nil 默认覆盖，String/List 不支持 false
 }
 
 // ZMember 表示 Redis ZSet 成员与分数。
@@ -259,8 +258,9 @@ func RebuildPolicy(value RebuildContextPolicy) *RebuildContextPolicy {
 // Item 表示缓存管理页可展示的缓存目标。
 type Item struct {
 	Index    string `json:"index"`    // Index 是缓存目标索引
-	Key      string `json:"key"`      // Key 是 Redis key 或 key 模板
-	KeyTitle string `json:"keyTitle"` // KeyTitle 是 Redis key 展示标题
+	Title    string `json:"title"`    // Title 是缓存目标展示名称
+	Key      string `json:"key"`      // Key 是注册后的固定 Redis key 或 Redis key 前缀
+	KeyTitle string `json:"keyTitle"` // KeyTitle 是 Redis key 展示模板
 	Type     string `json:"type"`     // Type 是 Redis 数据类型
 	Remark   string `json:"remark"`   // Remark 是缓存说明
 }
@@ -273,7 +273,8 @@ func (t Target) item() Item {
 	}
 	return Item{
 		Index:    t.Index,
-		Key:      keyTitle,
+		Title:    t.Title,
+		Key:      t.Key,
 		KeyTitle: keyTitle,
 		Type:     string(t.Type),
 		Remark:   t.Remark,

@@ -2,6 +2,7 @@ package tablecache
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"github.com/Is999/go-utils/errors"
@@ -37,15 +38,15 @@ type PrometheusMetrics struct {
 	prefixWaitTotal             *prometheus.CounterVec   // prefixWaitTotal 记录前缀全量刷新阻塞单 key 的次数
 	prefixRetryTotal            *prometheus.CounterVec   // prefixRetryTotal 记录单 key 因前缀全量刷新重试的次数
 	prefixDeleteTotal           *prometheus.CounterVec   // prefixDeleteTotal 记录前缀删除次数
-	prefixDeleteKeysTotal       *prometheus.CounterVec   // prefixDeleteKeysTotal 记录前缀删除 key 数量
+	prefixDeleteKeysTotal       *prometheus.CounterVec   // prefixDeleteKeysTotal 记录前缀操作实际删除的 key 数量
 	refreshEntryCount           *prometheus.HistogramVec // refreshEntryCount 记录单次刷新写入条数
-	lookupStateTotal            *prometheus.CounterVec   // lookupStateTotal 记录读取状态细分指标
+	lookupStateTotal            *prometheus.CounterVec   // lookupStateTotal 记录每次逻辑读取的最终状态
 	lookupRefreshTriggeredTotal *prometheus.CounterVec   // lookupRefreshTriggeredTotal 记录读穿触发刷新次数
 	refreshBatchTotal           *prometheus.CounterVec   // refreshBatchTotal 记录批量刷新与全量刷新任务次数
 	refreshBatchSize            *prometheus.HistogramVec // refreshBatchSize 记录每次批量刷新涉及的目标数量
 	refreshBatchSuccessItems    *prometheus.CounterVec   // refreshBatchSuccessItems 记录批量刷新成功条目数量
 	refreshBatchFailedItems     *prometheus.CounterVec   // refreshBatchFailedItems 记录批量刷新失败条目数量
-	scanFallbackTotal           *prometheus.CounterVec   // scanFallbackTotal 记录前缀删除降级 SCAN 次数
+	scanFallbackTotal           *prometheus.CounterVec   // scanFallbackTotal 记录实际执行的前缀降级 SCAN 次数
 }
 
 // WithPrometheusNamespace 设置 Prometheus 指标命名空间。
@@ -65,6 +66,10 @@ func WithPrometheusSubsystem(subsystem string) PrometheusMetricsOption {
 // WithPrometheusRegisterer 设置 Prometheus 指标注册器。
 func WithPrometheusRegisterer(registerer prometheus.Registerer) PrometheusMetricsOption {
 	return func(config *PrometheusMetricsConfig) {
+		if isNilInterface(registerer) {
+			config.Registerer = nil
+			return
+		}
 		config.Registerer = registerer
 	}
 }
@@ -73,7 +78,7 @@ func WithPrometheusRegisterer(registerer prometheus.Registerer) PrometheusMetric
 func WithPrometheusRefreshBuckets(buckets []float64) PrometheusMetricsOption {
 	return func(config *PrometheusMetricsConfig) {
 		if len(buckets) > 0 {
-			config.RefreshBuckets = buckets
+			config.RefreshBuckets = append([]float64(nil), buckets...)
 		}
 	}
 }
@@ -82,7 +87,7 @@ func WithPrometheusRefreshBuckets(buckets []float64) PrometheusMetricsOption {
 func WithPrometheusRefreshEntryBuckets(buckets []float64) PrometheusMetricsOption {
 	return func(config *PrometheusMetricsConfig) {
 		if len(buckets) > 0 {
-			config.RefreshEntryBuckets = buckets
+			config.RefreshEntryBuckets = append([]float64(nil), buckets...)
 		}
 	}
 }
@@ -91,14 +96,23 @@ func WithPrometheusRefreshEntryBuckets(buckets []float64) PrometheusMetricsOptio
 func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, error) {
 	config := PrometheusMetricsConfig{
 		Registerer:          prometheus.DefaultRegisterer,
-		RefreshBuckets:      prometheus.DefBuckets,
-		RefreshEntryBuckets: defaultRefreshEntryBuckets,
+		RefreshBuckets:      append([]float64(nil), prometheus.DefBuckets...),
+		RefreshEntryBuckets: append([]float64(nil), defaultRefreshEntryBuckets...),
 	}
 	for _, opt := range opts {
+		if isNilInterface(opt) {
+			return nil, errors.Wrapf(ErrInvalidConfig, "Prometheus Option不能为空")
+		}
 		opt(&config)
 	}
-	if config.Registerer == nil {
+	if isNilInterface(config.Registerer) {
 		config.Registerer = prometheus.DefaultRegisterer
+	}
+	if err := validateHistogramBuckets("刷新耗时", config.RefreshBuckets); err != nil {
+		return nil, errors.Tag(err)
+	}
+	if err := validateHistogramBuckets("刷新写入条数", config.RefreshEntryBuckets); err != nil {
+		return nil, errors.Tag(err)
 	}
 	metrics := &PrometheusMetrics{}
 	var err error
@@ -240,7 +254,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 			Namespace: config.Namespace,
 			Subsystem: config.Subsystem,
 			Name:      "prefix_delete_keys_total",
-			Help:      "tablecache prefix delete deleted key total count",
+			Help:      "tablecache prefix delete actual deleted key total count",
 		},
 		[]string{"index"},
 	))
@@ -265,7 +279,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 			Namespace: config.Namespace,
 			Subsystem: config.Subsystem,
 			Name:      "lookup_state_total",
-			Help:      "tablecache lookup state total count",
+			Help:      "tablecache logical lookup final state total count",
 		},
 		[]string{"index", "state"},
 	))
@@ -338,7 +352,7 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 			Namespace: config.Namespace,
 			Subsystem: config.Subsystem,
 			Name:      "scan_fallback_total",
-			Help:      "tablecache prefix delete scan fallback total count",
+			Help:      "tablecache executed prefix delete scan fallback total count",
 		},
 		[]string{"index"},
 	))
@@ -346,6 +360,19 @@ func NewPrometheusMetrics(opts ...PrometheusMetricsOption) (*PrometheusMetrics, 
 		return nil, errors.Tag(err)
 	}
 	return metrics, nil
+}
+
+// validateHistogramBuckets 在构造期拒绝非法桶，避免首次记录指标时触发 Prometheus panic。
+func validateHistogramBuckets(name string, buckets []float64) error {
+	for index, bucket := range buckets {
+		if math.IsNaN(bucket) {
+			return errors.Errorf("%s直方图桶不能包含NaN: index=%d", name, index)
+		}
+		if index > 0 && buckets[index-1] >= bucket {
+			return errors.Errorf("%s直方图桶必须严格递增: index=%d", name, index)
+		}
+	}
+	return nil
 }
 
 // RecordRefresh 记录刷新次数和刷新耗时。
@@ -394,7 +421,7 @@ func (m *PrometheusMetrics) RecordPrefixRetry(ctx context.Context, index string)
 	m.prefixRetryTotal.WithLabelValues(index).Inc()
 }
 
-// RecordPrefixDelete 记录前缀删除次数和删除 key 总数。
+// RecordPrefixDelete 记录前缀删除次数和实际删除 key 总数。
 func (m *PrometheusMetrics) RecordPrefixDelete(ctx context.Context, index string, prefix string, count int64) {
 	m.prefixDeleteTotal.WithLabelValues(index).Inc()
 	m.prefixDeleteKeysTotal.WithLabelValues(index).Add(float64(count))
@@ -405,7 +432,7 @@ func (m *PrometheusMetrics) RecordRefreshEntryCount(ctx context.Context, index s
 	m.refreshEntryCount.WithLabelValues(index).Observe(float64(count))
 }
 
-// RecordLookupState 记录读取状态细分指标。
+// RecordLookupState 记录一次逻辑读取的最终状态。
 func (m *PrometheusMetrics) RecordLookupState(ctx context.Context, index string, state LookupState) {
 	m.lookupStateTotal.WithLabelValues(index, string(state)).Inc()
 }
@@ -423,7 +450,7 @@ func (m *PrometheusMetrics) RecordRefreshBatch(ctx context.Context, mode string,
 	m.refreshBatchFailedItems.WithLabelValues(mode).Add(float64(failed))
 }
 
-// RecordScanFallback 记录前缀删除降级 SCAN 次数。
+// RecordScanFallback 记录实际执行的前缀删除降级 SCAN 次数。
 func (m *PrometheusMetrics) RecordScanFallback(ctx context.Context, index string, prefix string) {
 	m.scanFallbackTotal.WithLabelValues(index).Inc()
 }

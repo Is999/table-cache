@@ -7,25 +7,93 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math"
+	randv2 "math/rand/v2"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/Is999/go-utils/errors"
 	"github.com/redis/go-redis/v9"
-	"golang.org/x/sync/errgroup"
 )
 
 //go:embed redis_scripts/release_lock.lua
-var releaseLockLua string // releaseLockLua 是释放锁脚本内容
+var releaseLockLuaAsset string // releaseLockLuaAsset 是释放锁脚本资产
+
+var releaseLockLua = stripLeadingLuaComments(releaseLockLuaAsset) // releaseLockLua 是剥离文件头后的可执行脚本
 
 //go:embed redis_scripts/refresh_lock.lua
-var refreshLockLua string // refreshLockLua 是续期锁脚本内容
+var refreshLockLuaAsset string // refreshLockLuaAsset 是续期锁脚本资产
+
+var refreshLockLua = stripLeadingLuaComments(refreshLockLuaAsset) // refreshLockLua 是剥离文件头后的可执行脚本
 
 //go:embed redis_scripts/replace_collection.lua
-var replaceCollectionScript string // replaceCollectionScript 是覆盖集合脚本内容
+var replaceCollectionAsset string // replaceCollectionAsset 是覆盖集合脚本资产
+
+var replaceCollectionScript = stripLeadingLuaComments(replaceCollectionAsset) // replaceCollectionScript 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/mutate_collection.lua
+var mutateCollectionAsset string // mutateCollectionAsset 是增量集合写入与TTL脚本资产
+
+var mutateCollectionScript = stripLeadingLuaComments(mutateCollectionAsset) // mutateCollectionScript 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/prefix_index_add.lua
+var prefixIndexAddAsset string // prefixIndexAddAsset 是前缀索引分片登记与过期剪枝脚本资产
+
+var prefixIndexAddScript = stripLeadingLuaComments(prefixIndexAddAsset) // prefixIndexAddScript 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/prefix_index_activate.lua
+var prefixIndexActivateAsset string // prefixIndexActivateAsset 是前缀索引活跃分片登记脚本资产
+
+var prefixIndexActivateLua = stripLeadingLuaComments(prefixIndexActivateAsset) // prefixIndexActivateLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/prefix_index_commit.lua
+var prefixIndexCommitAsset string // prefixIndexCommitAsset 是前缀索引manifest原子提交脚本资产
+
+var prefixIndexCommitLua = stripLeadingLuaComments(prefixIndexCommitAsset) // prefixIndexCommitLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/prefix_index_prepare.lua
+var prefixIndexPrepareAsset string // prefixIndexPrepareAsset 是前缀索引重建准备脚本资产
+
+var prefixIndexPrepareLua = stripLeadingLuaComments(prefixIndexPrepareAsset) // prefixIndexPrepareLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/fields_empty_registry.lua
+var fieldsEmptyRegistryAsset string // fieldsEmptyRegistryAsset 是字段组合空值registry脚本资产
+
+var fieldsEmptyRegistryLua = stripLeadingLuaComments(fieldsEmptyRegistryAsset) // fieldsEmptyRegistryLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/replace_fields_with_empty.lua
+var replaceFieldsWithEmptyAsset string // replaceFieldsWithEmptyAsset 是字段空值与旧Hash字段一致切换脚本资产
+
+var replaceFieldsWithEmptyLua = stripLeadingLuaComments(replaceFieldsWithEmptyAsset) // replaceFieldsWithEmptyLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/delete_hash_fields.lua
+var deleteHashFieldsAsset string // deleteHashFieldsAsset 是带锁删除Hash字段脚本资产
+
+var deleteHashFieldsLua = stripLeadingLuaComments(deleteHashFieldsAsset) // deleteHashFieldsLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/acquire_refresh_lock.lua
+var acquireRefreshLockAsset string // acquireRefreshLockAsset 是刷新锁获取与owner读取脚本资产
+
+var acquireRefreshLockLua = stripLeadingLuaComments(acquireRefreshLockAsset) // acquireRefreshLockLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/replace_with_marker.lua
+var replaceWithMarkerAsset string // replaceWithMarkerAsset 是元信息marker与旧缓存一致切换脚本资产
+
+var replaceWithMarkerLua = stripLeadingLuaComments(replaceWithMarkerAsset) // replaceWithMarkerLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/guarded_mutation.lua
+var guardedMutationAsset string // guardedMutationAsset 是锁owner校验与业务写删原子提交脚本资产
+
+var guardedMutationLua = stripLeadingLuaComments(guardedMutationAsset) // guardedMutationLua 是剥离文件头后的可执行脚本
+
+//go:embed redis_scripts/read_collection_limited.lua
+var readCollectionLimitedAsset string // readCollectionLimitedAsset 是集合规模检查与全量读取原子脚本资产
+
+var readCollectionLimitedLua = stripLeadingLuaComments(readCollectionLimitedAsset) // readCollectionLimitedLua 是剥离文件头后的可执行脚本
 
 // releaseLockScript 仅在锁 owner 一致时释放重建锁。
 var releaseLockScript = redis.NewScript(releaseLockLua)
@@ -33,13 +101,42 @@ var releaseLockScript = redis.NewScript(releaseLockLua)
 // refreshLockScript 仅在锁 owner 一致时续期重建锁。
 var refreshLockScript = redis.NewScript(refreshLockLua)
 
+// replaceWithMarkerScript 先写元信息 marker，再删除同槽旧缓存。
+var replaceWithMarkerScript = redis.NewScript(replaceWithMarkerLua)
+
+// acquireRefreshLockScript 原子获取刷新锁，竞争失败时返回当前owner。
+var acquireRefreshLockScript = redis.NewScript(acquireRefreshLockLua)
+
+// readCollectionLimitedScript 原子检查集合规模并读取完整值。
+var readCollectionLimitedScript = redis.NewScript(readCollectionLimitedLua)
+
+// collectionReplaceSeq 为随机源异常时的集合临时 key 提供进程内去重序列。
+var collectionReplaceSeq atomic.Uint64
+
 const (
 	// defaultUnlinkChunkSize 表示一次 Pipeline 中聚合的 UNLINK 命令数量，避免超大 pipeline 带来内存尖刺。
 	defaultUnlinkChunkSize = 512
-	// defaultScanUnlinkConcurrency 表示单个 Redis 节点执行 DeletePattern 时的默认删除 worker 数，1 表示保持扫描与删除串行。
-	defaultScanUnlinkConcurrency = 1
 	// defaultWriteBatchChunkSize 表示一次写入 Pipeline 中最多聚合的 Entry 数量，避免全量刷新生成超大请求。
 	defaultWriteBatchChunkSize = 256
+	// defaultCollectionPageCount 表示分页读取默认及无配置时的单页硬上限。
+	defaultCollectionPageCount = int64(1000)
+	// defaultMaxCollectionCount 表示集合全量读写默认成员上限，0 仍可由调用方显式关闭。
+	defaultMaxCollectionCount = 5000
+	// maxUnlinkChunkSize 表示单个 UNLINK Pipeline 允许的命令数硬上限。
+	maxUnlinkChunkSize = 10_000
+	// maxPipelineRetries 表示幂等 Pipeline 允许的瞬时失败重试硬上限。
+	maxPipelineRetries = 10
+	// maxDefaultJitterRatio 表示默认 TTL 抖动最多等于基础 TTL。
+	maxDefaultJitterRatio = 1.0
+)
+
+const (
+	// collectionReadStateHit 表示受限集合读取成功。
+	collectionReadStateHit = "tablecache_collection_hit"
+	// collectionReadStateMiss 表示集合 key 不存在。
+	collectionReadStateMiss = "tablecache_collection_miss"
+	// collectionReadStateTooLarge 表示集合成员数超过读取上限。
+	collectionReadStateTooLarge = "tablecache_collection_too_large"
 )
 
 // RedisStoreOption 表示 RedisStore 可选配置。
@@ -47,14 +144,15 @@ type RedisStoreOption func(*RedisStore)
 
 // RedisStore 是基于 go-redis 的 Store 适配器，可直接服务 go-zero、Gin、Kratos 等 Go 框架。
 type RedisStore struct {
-	client                  redis.UniversalClient // client 是 Redis 通用客户端，兼容单机、哨兵和集群
+	client                  redis.UniversalClient // client 是 Redis 通用客户端，支持单机、哨兵主节点和Cluster master；Ring会在校验期拒绝
 	encoder                 Encoder               // encoder 是复杂值序列化函数
 	pipelineRetries         int                   // pipelineRetries 表示批量 UNLINK/覆盖写在瞬时失败时的最大重试次数
 	unlinkChunkSize         int                   // unlinkChunkSize 表示每个 Pipeline 批次最多聚合的 UNLINK 命令数，用于控制网络往返与内存占用平衡
-	scanUnlinkConcurrency   int                   // scanUnlinkConcurrency 表示 DeletePattern 扫描期间并发执行 UNLINK 的 worker 数，适合大 keyspace 加速删除
 	maxCollectionReadCount  int64                 // maxCollectionReadCount 表示全量集合读取前允许的最大成员数，0 表示不限制
 	maxCollectionWriteCount int                   // maxCollectionWriteCount 表示单 Entry 集合写入允许的最大成员数，0 表示不限制
 	defaultJitterRatio      float64               // defaultJitterRatio 表示未显式配置 Jitter 时按 TTL 比例增加默认抖动
+	topologyState           atomic.Int32          // topologyState 缓存已确认的单节点或Cluster状态，避免前缀热路径重复探测
+	configErr               error                 // configErr 保存 option 构造期错误，由 Validate 在启动期统一返回
 }
 
 // PipelineExecError 表示 Pipeline 执行失败的增强错误信息。
@@ -94,6 +192,18 @@ type pipelineCmd struct {
 	cmd redis.Cmder // cmd 表示当前 pipeline 中的具体命令实例
 }
 
+// preparedEntry 保存一次完成编码、边界校验和 TTL 计算后的写入计划，分批提交时不再重复处理业务值。
+type preparedEntry struct {
+	key         string         // key 是目标 Redis key
+	typ         CacheType      // typ 是缓存数据类型
+	ttl         time.Duration  // ttl 是本次计算后的实际 TTL
+	overwrite   bool           // overwrite 表示是否覆盖整个 key
+	stringValue string         // stringValue 是已编码的 String 值
+	mapValues   map[string]any // mapValues 是已编码的 Hash 字段
+	values      []any          // values 是已编码的 List 或 Set 成员
+	zValues     []redis.Z      // zValues 是已编码的 ZSet 成员
+}
+
 // uniqueSortedKeys 对失败 key 做排序去重，便于日志与监控稳定展示。
 func uniqueSortedKeys(keys []string) []string {
 	if len(keys) == 0 {
@@ -122,101 +232,68 @@ func cleanRedisKeys(keys []string) []string {
 	return cleanKeys
 }
 
-// stringSliceToAny 把字符串切片转换为 go-redis 可接受的可变参数列表，避免每个调用点重复分配逻辑。
-func stringSliceToAny(values []string) []any {
-	args := make([]any, 0, len(values)) // args 是传给 Redis 命令的成员参数列表
-	for _, value := range values {
-		args = append(args, value)
-	}
-	return args
-}
-
-// cleanMutationEntries 清洗合并变更中的写入条目，只裁剪 key 空白；空 key 保留给 enqueueWrite 返回明确错误。
-func cleanMutationEntries(entries []Entry) []Entry {
-	cleanEntries := make([]Entry, 0, len(entries)) // cleanEntries 表示裁剪 key 空白后的写入条目列表
-	for _, entry := range entries {
-		entry.Key = strings.TrimSpace(entry.Key)
-		cleanEntries = append(cleanEntries, entry)
-	}
-	return cleanEntries
-}
-
-// cleanPrefixIndexMutations 清洗前缀索引变更，过滤空索引 key 与空成员列表。
-func cleanPrefixIndexMutations(mutations []PrefixIndexMutation) []PrefixIndexMutation {
-	cleanMutations := make([]PrefixIndexMutation, 0, len(mutations)) // cleanMutations 表示可直接提交给 Redis 的索引变更列表
-	for _, mutation := range mutations {
-		mutation.IndexKey = strings.TrimSpace(mutation.IndexKey)
-		mutation.Keys = cleanRedisKeys(mutation.Keys)
-		if mutation.IndexKey != "" && len(mutation.Keys) > 0 {
-			cleanMutations = append(cleanMutations, mutation)
-		}
-	}
-	return cleanMutations
-}
-
-// mutationBatchCount 计算合并变更按 chunkSize 拆分后的批次数。
-func mutationBatchCount(chunkSize int, primaryLen int, indexMutations []PrefixIndexMutation) int {
-	maxLen := primaryLen // maxLen 表示所有主数据与索引成员中的最大列表长度
-	for _, mutation := range indexMutations {
-		if len(mutation.Keys) > maxLen {
-			maxLen = len(mutation.Keys)
-		}
-	}
-	if maxLen == 0 {
-		return 0
-	}
-	if chunkSize <= 0 {
-		chunkSize = defaultWriteBatchChunkSize
-	}
-	return (maxLen + chunkSize - 1) / chunkSize
-}
-
-// mutationBatchRange 返回第 batch 个批次在长度 total 上的左右边界。
-func mutationBatchRange(total int, batch int, chunkSize int) (int, int, bool) {
-	start := batch * chunkSize // start 表示当前批次起始下标
-	if start >= total {
-		return 0, 0, false
-	}
-	end := start + chunkSize // end 表示当前批次结束下标，不超过 total
-	if end > total {
-		end = total
-	}
-	return start, end, true
-}
-
 // NewRedisStore 创建 go-redis 存储适配器。
 func NewRedisStore(client redis.UniversalClient, opts ...RedisStoreOption) *RedisStore {
 	store := &RedisStore{
-		client:                client,
-		encoder:               defaultEncoder,
-		pipelineRetries:       1,
-		unlinkChunkSize:       defaultUnlinkChunkSize,
-		scanUnlinkConcurrency: defaultScanUnlinkConcurrency,
-		defaultJitterRatio:    0.1,
+		client:                  client,
+		encoder:                 defaultEncoder,
+		pipelineRetries:         1,
+		unlinkChunkSize:         defaultUnlinkChunkSize,
+		defaultJitterRatio:      0.1,
+		maxCollectionReadCount:  defaultMaxCollectionCount,
+		maxCollectionWriteCount: defaultMaxCollectionCount,
 	}
 	for _, opt := range opts {
+		if isNilInterface(opt) {
+			store.setConfigError(errors.Errorf("RedisStore Option不能为空"))
+			continue
+		}
 		opt(store)
 	}
 	return store
+}
+
+// validate 校验 RedisStore 是否具备可用客户端和合法配置。
+func (s *RedisStore) validate() error {
+	if s == nil || isNilInterface(s.client) {
+		return errors.Errorf("Redis客户端未初始化")
+	}
+	if s.isRingTopology() {
+		return errors.Wrapf(ErrRedisTopologyUnsupported, "Redis Ring故障重映射可能复活旧值，table-cache拒绝使用")
+	}
+	if cluster, ok := s.client.(*redis.ClusterClient); ok {
+		options := cluster.Options()
+		if options != nil && (options.ReadOnly || options.RouteByLatency || options.RouteRandomly) {
+			return errors.Errorf("Redis Cluster必须关闭副本读路由，确保锁、marker与业务值读取主节点")
+		}
+	}
+	if s.configErr != nil {
+		return errors.Tag(s.configErr)
+	}
+	return nil
+}
+
+// ValidateTablecacheStore 执行 Manager 构造期专用的 RedisStore 校验。
+func (s *RedisStore) ValidateTablecacheStore() error {
+	return s.validate()
+}
+
+// setConfigError 保留第一个构造期配置错误，供启动校验统一返回。
+func (s *RedisStore) setConfigError(err error) {
+	if s != nil && s.configErr == nil && err != nil {
+		s.configErr = err
+	}
 }
 
 // WithUnlinkChunkSize 设置批量删除时单个 Pipeline 的 UNLINK 命令数量。
 // 较大的 chunk 可减少网络往返，较小的 chunk 可降低单次请求体积和 Redis 侧瞬时压力。
 func WithUnlinkChunkSize(size int) RedisStoreOption {
 	return func(store *RedisStore) {
-		if size > 0 {
+		if size > 0 && size <= maxUnlinkChunkSize {
 			store.unlinkChunkSize = size
+			return
 		}
-	}
-}
-
-// WithScanUnlinkConcurrency 设置 DeletePattern 在单个 Redis 节点上的并发删除 worker 数。
-// SCAN 游标本身必须顺序推进；该配置只把扫描到的 key 分发给多个 UNLINK worker，用于大 keyspace 下重叠扫描和删除耗时。
-func WithScanUnlinkConcurrency(concurrency int) RedisStoreOption {
-	return func(store *RedisStore) {
-		if concurrency > 0 {
-			store.scanUnlinkConcurrency = concurrency
-		}
+		store.setConfigError(errors.Errorf("UNLINK批次大小必须在1到%d之间", maxUnlinkChunkSize))
 	}
 }
 
@@ -225,458 +302,253 @@ func WithRedisEncoder(encoder Encoder) RedisStoreOption {
 	return func(store *RedisStore) {
 		if encoder != nil {
 			store.encoder = encoder
+			return
 		}
+		store.setConfigError(errors.Errorf("Redis编码器不能为空"))
 	}
 }
 
 // WithPipelineRetries 设置批量删除与覆盖写的瞬时失败重试次数。
 func WithPipelineRetries(retries int) RedisStoreOption {
 	return func(store *RedisStore) {
-		if retries >= 0 {
+		if retries >= 0 && retries <= maxPipelineRetries {
 			store.pipelineRetries = retries
+			return
 		}
+		store.setConfigError(errors.Errorf("Pipeline重试次数必须在0到%d之间", maxPipelineRetries))
 	}
 }
 
-// WithMaxCollectionReadCount 设置全量读取 Hash/List/Set/ZSet 前允许的最大成员数；0 表示不限制。
+// WithMaxCollectionReadCount 设置全量读取 Hash/List/Set/ZSet 前允许的最大成员数；默认5000，0表示显式不限制。
 func WithMaxCollectionReadCount(limit int64) RedisStoreOption {
 	return func(store *RedisStore) {
 		if limit >= 0 {
 			store.maxCollectionReadCount = limit
+			return
 		}
+		store.setConfigError(errors.Errorf("集合读取上限不能为负数"))
 	}
 }
 
-// WithMaxCollectionWriteCount 设置单个 Entry 写入集合成员数上限；0 表示不限制。
+// WithMaxCollectionWriteCount 设置单个 Entry 写入集合成员数上限；默认5000，0表示显式不限制。
 func WithMaxCollectionWriteCount(limit int) RedisStoreOption {
 	return func(store *RedisStore) {
 		if limit >= 0 {
 			store.maxCollectionWriteCount = limit
+			return
 		}
+		store.setConfigError(errors.Errorf("集合写入上限不能为负数"))
 	}
 }
 
 // WithDefaultJitterRatio 设置未显式配置 Jitter 时的默认 TTL 抖动比例；0 表示关闭默认抖动。
 func WithDefaultJitterRatio(ratio float64) RedisStoreOption {
 	return func(store *RedisStore) {
-		if ratio >= 0 {
+		if ratio >= 0 && ratio <= maxDefaultJitterRatio && !math.IsNaN(ratio) && !math.IsInf(ratio, 0) {
 			store.defaultJitterRatio = ratio
+			return
 		}
+		store.setConfigError(errors.Errorf("默认TTL抖动比例必须是0到%.0f之间的有限数", maxDefaultJitterRatio))
 	}
 }
 
-// ApplyMutation 使用有界 Pipeline 合并提交删除、写入与前缀索引维护，减少刷新链路 Redis 往返。
+// ApplyMutation 按“索引先加、业务写删原子提交”的故障安全顺序提交变更。
 func (s *RedisStore) ApplyMutation(ctx context.Context, mutation StoreMutation) error {
-	if s == nil || s.client == nil {
-		return errors.Errorf("Redis客户端未初始化")
-	}
-	deleteKeys := cleanRedisKeys(mutation.DeleteKeys)              // deleteKeys 表示本次需要 UNLINK 的真实 Redis key
-	removeIndex := cleanPrefixIndexMutations(mutation.RemoveIndex) // removeIndex 表示本次需要从索引集合剔除的成员批次
-	writeEntries := cleanMutationEntries(mutation.WriteEntries)    // writeEntries 表示本次需要写入的缓存条目
-	addIndex := cleanPrefixIndexMutations(mutation.AddIndex)       // addIndex 表示本次需要加入索引集合的成员批次
-	if err := s.validateWriteEntries(writeEntries); err != nil {
+	if err := s.validate(); err != nil {
 		return errors.Tag(err)
 	}
-	if err := s.applyDeleteIndexMutation(ctx, deleteKeys, removeIndex); err != nil {
+	deleteKeys := cleanRedisKeys(mutation.DeleteKeys) // deleteKeys 表示本次需要 UNLINK 的真实 Redis key
+	prepared, err := s.prepareWriteEntries(mutation.WriteEntries)
+	if err != nil {
 		return errors.Tag(err)
 	}
-	if err := s.applyWriteIndexMutation(ctx, writeEntries, addIndex); err != nil {
+	if err := validateMutation(deleteKeys, prepared); err != nil {
 		return errors.Tag(err)
 	}
-	return nil
-}
-
-// AddPrefixIndexKeys 把一批真实 Redis key 写入前缀索引集合，供 DeleteByPrefix 优先走索引删除。
-func (s *RedisStore) AddPrefixIndexKeys(ctx context.Context, indexKey string, ttl time.Duration, keys ...string) error {
-	if s == nil || s.client == nil {
-		return errors.Errorf("Redis客户端未初始化")
+	guards, err := cleanLockGuards(mutation.Guards)
+	if err != nil {
+		return errors.Tag(err)
 	}
-	indexKey = strings.TrimSpace(indexKey)
-	if indexKey == "" {
-		return nil
+	if len(guards) > 0 && len(prepared) > 1 {
+		return errors.Wrapf(ErrInvalidConfig, "带锁缓存变更最多写入一条Entry")
 	}
-	cleanKeys := cleanRedisKeys(keys) // cleanKeys 表示需要加入索引的有效业务或元信息 key
-	if len(cleanKeys) == 0 {
-		return nil
-	}
-	chunkSize := s.unlinkChunkSize // chunkSize 表示单次 SADD 提交的成员数量，复用删除批次配置控制网络包大小
-	if chunkSize <= 0 {
-		chunkSize = defaultUnlinkChunkSize
-	}
-	for start := 0; start < len(cleanKeys); start += chunkSize {
-		end := start + chunkSize // end 表示当前索引写入批次的右边界，避免一次 SADD 参数过多
-		if end > len(cleanKeys) {
-			end = len(cleanKeys)
-		}
-		pipe := s.client.Pipeline() // pipe 合并 SADD 与 EXPIRE，减少索引维护的网络往返
-		// SADD 只把 indexKey 当作 Redis key，成员是普通字符串，因此兼容 Cluster 跨槽业务 key。
-		pipe.SAdd(ctx, indexKey, stringSliceToAny(cleanKeys[start:end])...)
-		if ttl > 0 {
-			pipe.Expire(ctx, indexKey, ttl)
-		}
-		if _, err := pipe.Exec(ctx); err != nil {
+	for _, indexMutation := range mutation.AddIndex {
+		if err := s.addPrefixIndexKeysGuarded(ctx, indexMutation.IndexKey, indexMutation.TTL, guards, indexMutation.Keys...); err != nil {
 			return errors.Tag(err)
 		}
 	}
+	if len(guards) > 0 && len(prepared) == 0 && len(deleteKeys) == 0 {
+		return nil
+	}
+	if len(guards) > 0 {
+		var entry *preparedEntry
+		if len(prepared) == 1 {
+			entry = &prepared[0]
+		}
+		_, err := s.runGuardedMutation(ctx, s.client, guards, entry, deleteKeys)
+		return errors.Tag(err)
+	}
+	if err := s.writePreparedEntries(ctx, prepared); err != nil {
+		return errors.Tag(err)
+	}
+	if _, err := s.unlinkKeys(ctx, s.client, deleteKeys); err != nil {
+		return errors.Tag(err)
+	}
 	return nil
 }
 
-// RemovePrefixIndexKeys 从前缀索引集合移除一批 key，避免 DeleteByKey 或状态切换后留下大量过期成员。
-func (s *RedisStore) RemovePrefixIndexKeys(ctx context.Context, indexKey string, keys ...string) error {
-	if s == nil || s.client == nil {
-		return errors.Errorf("Redis客户端未初始化")
+// validateMutation 拒绝会让故障安全顺序自相删除的数据重叠。
+func validateMutation(deleteKeys []string, entries []preparedEntry) error {
+	writeKeys := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		writeKeys[entry.key] = struct{}{}
 	}
-	indexKey = strings.TrimSpace(indexKey)
-	if indexKey == "" {
-		return nil
-	}
-	cleanKeys := cleanRedisKeys(keys) // cleanKeys 表示需要从索引中移除的有效成员
-	if len(cleanKeys) == 0 {
-		return nil
-	}
-	chunkSize := s.unlinkChunkSize // chunkSize 表示单次 SREM 提交的成员数量，避免大索引清理时请求体过大
-	if chunkSize <= 0 {
-		chunkSize = defaultUnlinkChunkSize
-	}
-	for start := 0; start < len(cleanKeys); start += chunkSize {
-		end := start + chunkSize // end 表示当前索引移除批次的右边界
-		if end > len(cleanKeys) {
-			end = len(cleanKeys)
+	for _, key := range deleteKeys {
+		if _, exists := writeKeys[key]; exists {
+			return errors.Wrapf(ErrInvalidConfig, "故障安全变更不能同时删除和写入key[%s]", key)
 		}
-		if err := s.client.SRem(ctx, indexKey, stringSliceToAny(cleanKeys[start:end])...).Err(); err != nil {
+	}
+	return nil
+}
+
+// ReplaceWithMarker 先写入 String marker，成功后再删除同槽旧缓存。
+func (s *RedisStore) ReplaceWithMarker(ctx context.Context, guards []LockGuard, marker Entry, deleteKeys ...string) error {
+	if err := s.validate(); err != nil {
+		return errors.Tag(err)
+	}
+	if marker.Type != TypeString {
+		return errors.Errorf("缓存marker必须是String类型")
+	}
+	prepared, err := s.prepareWriteEntry(marker)
+	if err != nil {
+		return errors.Tag(err)
+	}
+	if prepared.ttl < 0 {
+		return errors.Errorf("缓存marker TTL不能小于0")
+	}
+	deleteKeys = uniqueSortedKeys(cleanRedisKeys(deleteKeys))
+	guards, err = cleanLockGuards(guards)
+	if err != nil {
+		return errors.Tag(err)
+	}
+	if len(guards) == 0 {
+		return errors.Errorf("缓存marker提交缺少锁guard")
+	}
+	keys := make([]string, 0, len(guards)+len(deleteKeys)+1)
+	args := make([]any, 0, len(guards)+3)
+	args = append(args, len(guards))
+	for _, guard := range guards {
+		keys = append(keys, guard.Key)
+		args = append(args, guard.Owner)
+	}
+	keys = append(keys, prepared.key)
+	keys = append(keys, deleteKeys...)
+	if err := rejectGuardKeyOverlap(guards, keys[len(guards):]...); err != nil {
+		return errors.Tag(err)
+	}
+	if s.knownDistributedClient() {
+		if err := validateSameRedisSlot(keys); err != nil {
 			return errors.Tag(err)
 		}
 	}
+	for _, key := range deleteKeys {
+		if key == prepared.key {
+			return errors.Errorf("缓存marker不能同时被删除")
+		}
+	}
+	args = append(args, prepared.stringValue, ttlMilliseconds(prepared.ttl))
+	if _, err := replaceWithMarkerScript.Run(ctx, s.client, keys, args...).Int64(); err != nil {
+		return errors.Tag(normalizeLockGuardError(err))
+	}
 	return nil
 }
 
-// DeletePrefixIndexKeys 分批遍历前缀索引集合，并删除索引内记录的真实 Redis key。
-// 该方法只读取索引集合本身，不扫描 Redis 全局 keyspace，适合 key 数特别多的线上实例。
-func (s *RedisStore) DeletePrefixIndexKeys(ctx context.Context, indexKey string, count int64) (int64, error) {
-	if s == nil || s.client == nil {
-		return 0, nil
-	}
-	indexKey = strings.TrimSpace(indexKey)
-	if indexKey == "" {
-		return 0, nil
-	}
-	if count <= 0 {
-		count = defaultScanCount
-	}
-	cursor := uint64(0)    // cursor 是 SSCAN 返回的集合游标；遍历期间不修改索引集合，避免游标遗漏成员
-	var deletedCount int64 // deletedCount 表示按索引成员尝试删除的 key 数量，用于 DeleteByPrefix 指标
-	for {
-		keys, next, err := s.client.SScan(ctx, indexKey, cursor, "*", count).Result() // keys 是当前索引游标返回的一批真实 Redis key
-		if err != nil {
-			return deletedCount, errors.Tag(err)
+// validateSameRedisSlot 校验原子脚本涉及的全部 key 位于同一 Redis Cluster slot。
+func validateSameRedisSlot(keys []string) error {
+	var slotTag string
+	for _, key := range cleanRedisKeys(keys) {
+		tag := redisClusterHashTag(key)
+		if slotTag == "" {
+			slotTag = tag
+			continue
 		}
-		if len(keys) > 0 {
-			if err := s.unlinkKeys(ctx, s.client, keys); err != nil {
-				return deletedCount, errors.Tag(err)
-			}
-			deletedCount += int64(len(keys))
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-	if err := s.unlinkKeys(ctx, s.client, []string{indexKey}); err != nil {
-		return deletedCount, errors.Tag(err)
-	}
-	return deletedCount, nil
-}
-
-// Delete 删除一个或多个 Redis key。
-func (s *RedisStore) Delete(ctx context.Context, keys ...string) error {
-	if s == nil || s.client == nil || len(keys) == 0 {
-		return nil
-	}
-	cleanKeys := cleanRedisKeys(keys)
-	if len(cleanKeys) == 0 {
-		return nil
-	}
-	return s.unlinkKeys(ctx, s.client, cleanKeys)
-}
-
-// applyDeleteIndexMutation 合并执行旧 key 删除与索引成员移除，保持“先删除真实 key，再清理索引”的语义。
-func (s *RedisStore) applyDeleteIndexMutation(ctx context.Context, deleteKeys []string, removeIndex []PrefixIndexMutation) error {
-	chunkSize := s.unlinkChunkSize
-	if chunkSize <= 0 {
-		chunkSize = defaultUnlinkChunkSize
-	}
-	batches := mutationBatchCount(chunkSize, len(deleteKeys), removeIndex) // batches 表示删除和索引移除需要拆分的 Pipeline 批次数
-	for batch := 0; batch < batches; batch++ {
-		var finalCmds []pipelineCmd
-		err := execPipelineWithRetry(ctx, s.pipelineRetries, func() error {
-			pipe := s.client.Pipeline()
-			cmds := make([]pipelineCmd, 0, chunkSize*(1+len(removeIndex))) // cmds 用于检查 Pipeline 内单命令错误并聚合失败 key
-			if start, end, ok := mutationBatchRange(len(deleteKeys), batch, chunkSize); ok {
-				for _, key := range deleteKeys[start:end] {
-					cmds = append(cmds, pipelineCmd{key: key, cmd: pipe.Unlink(ctx, key)})
-				}
-			}
-			for _, mutation := range removeIndex {
-				start, end, ok := mutationBatchRange(len(mutation.Keys), batch, chunkSize)
-				if !ok {
-					continue
-				}
-				cmd := pipe.SRem(ctx, mutation.IndexKey, stringSliceToAny(mutation.Keys[start:end])...)
-				cmds = append(cmds, pipelineCmd{key: mutation.IndexKey, cmd: cmd})
-			}
-			finalCmds = cmds
-			if len(cmds) == 0 {
-				return nil
-			}
-			return execAndCheckPipeline(ctx, pipe, cmds)
-		})
-		if err != nil {
-			return errors.Tag(&PipelineExecError{
-				Operation:  "apply_mutation_delete_index",
-				FailedKeys: failedPipelineKeys(finalCmds),
-				Cause:      err,
-			})
+		if tag != slotTag {
+			return errors.Errorf("原子缓存变更包含跨slot key")
 		}
 	}
 	return nil
 }
 
-// applyWriteIndexMutation 合并执行缓存写入与索引成员添加，减少刷新写回阶段 Redis 往返。
-func (s *RedisStore) applyWriteIndexMutation(ctx context.Context, entries []Entry, addIndex []PrefixIndexMutation) error {
-	chunkSize := defaultWriteBatchChunkSize
-	batches := mutationBatchCount(chunkSize, len(entries), addIndex) // batches 表示写入和索引添加需要拆分的 Pipeline 批次数
-	retries := s.pipelineRetries
-	if len(entries) > 0 && !entriesRetryable(entries) {
-		// 非覆盖写可能包含 RPUSH/SADD/ZADD 等增量语义，失败后自动重试会放大写入效果，因此关闭重试。
-		retries = 0
+// unlinkKeys 使用 Pipeline 单 key UNLINK，返回真实删除数量并只重试未确认成功的命令。
+func (s *RedisStore) unlinkKeys(ctx context.Context, client redis.UniversalClient, keys []string) (int64, error) {
+	if client == nil {
+		return 0, errors.Errorf("Redis客户端未初始化")
 	}
-	for batch := 0; batch < batches; batch++ {
-		var finalCmds []pipelineCmd
-		err := execPipelineWithRetry(ctx, retries, func() error {
-			pipe := s.client.Pipeline()
-			cmds := make([]pipelineCmd, 0, chunkSize*(2+len(addIndex))) // cmds 用于收集写入命令与索引命令的执行状态
-			if start, end, ok := mutationBatchRange(len(entries), batch, chunkSize); ok {
-				for _, entry := range entries[start:end] {
-					if err := s.enqueueWrite(ctx, pipe, entry, &cmds); err != nil {
-						return errors.Tag(err)
-					}
-				}
-			}
-			for _, mutation := range addIndex {
-				start, end, ok := mutationBatchRange(len(mutation.Keys), batch, chunkSize)
-				if !ok {
-					continue
-				}
-				cmd := pipe.SAdd(ctx, mutation.IndexKey, stringSliceToAny(mutation.Keys[start:end])...)
-				cmds = append(cmds, pipelineCmd{key: mutation.IndexKey, cmd: cmd})
-				if mutation.TTL > 0 {
-					expireCmd := pipe.Expire(ctx, mutation.IndexKey, mutation.TTL)
-					cmds = append(cmds, pipelineCmd{key: mutation.IndexKey, cmd: expireCmd})
-				}
-			}
-			finalCmds = cmds
-			if len(cmds) == 0 {
-				return nil
-			}
-			return execAndCheckPipeline(ctx, pipe, cmds)
-		})
-		if err != nil {
-			return errors.Tag(&PipelineExecError{
-				Operation:  "apply_mutation_write_index",
-				FailedKeys: failedPipelineKeys(finalCmds),
-				Cause:      err,
-			})
-		}
-	}
-	return nil
-}
-
-// DeletePattern 使用 SCAN 增量删除匹配 key，避免 KEYS 阻塞线上 Redis。
-func (s *RedisStore) DeletePattern(ctx context.Context, pattern string, count int64) (int64, error) {
-	if s == nil || s.client == nil {
-		return 0, nil
-	}
-	pattern = strings.TrimSpace(pattern)
-	if pattern == "" {
-		return 0, nil
-	}
-	if count <= 0 {
-		count = defaultScanCount
-	}
-	if clusterClient, ok := s.client.(*redis.ClusterClient); ok {
-		// deletedCount 汇总所有 master 的删除数量；Cluster SCAN 必须按节点执行，ForEachMaster 已提供节点级并发。
-		var deletedCount atomic.Int64
-		err := clusterClient.ForEachMaster(ctx, func(masterCtx context.Context, master *redis.Client) error {
-			count, err := s.scanDeletePattern(masterCtx, master, pattern, count)
-			if err != nil {
-				return errors.Tag(err)
-			}
-			deletedCount.Add(count)
-			return nil
-		})
-		return deletedCount.Load(), errors.Tag(err)
-	}
-	return s.scanDeletePattern(ctx, s.client, pattern, count)
-}
-
-// scanDeletePattern 在指定 Redis 客户端上重复执行 SCAN + UNLINK，直到一整轮没有命中。
-func (s *RedisStore) scanDeletePattern(ctx context.Context, client redis.UniversalClient, pattern string, count int64) (int64, error) {
-	var totalCount int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return totalCount, errors.Tag(err)
-		}
-		deleted, err := s.scanDeletePatternPass(ctx, client, pattern, count)
-		totalCount += deleted
-		if err != nil {
-			return totalCount, errors.Tag(err)
-		}
-		if deleted == 0 {
-			return totalCount, nil
-		}
-	}
-}
-
-// scanDeletePatternPass 在指定 Redis 客户端上执行一轮完整的 SCAN + UNLINK。
-func (s *RedisStore) scanDeletePatternPass(ctx context.Context, client redis.UniversalClient, pattern string, count int64) (int64, error) {
-	if s.scanUnlinkConcurrency > 1 {
-		return s.scanDeletePatternConcurrent(ctx, client, pattern, count)
-	}
-	return s.scanDeletePatternSerial(ctx, client, pattern, count)
-}
-
-// scanDeletePatternSerial 串行执行 SCAN 与 UNLINK，适合线上默认保守策略，避免清理任务过度抢占 Redis 连接和 CPU。
-func (s *RedisStore) scanDeletePatternSerial(ctx context.Context, client redis.UniversalClient, pattern string, count int64) (int64, error) {
-	cursor := uint64(0)
-	var deletedCount int64
-	for {
-		keys, next, err := client.Scan(ctx, cursor, pattern, count).Result()
-		if err != nil {
-			return deletedCount, errors.Tag(err)
-		}
-		if len(keys) > 0 {
-			if err := s.unlinkKeys(ctx, client, keys); err != nil {
-				return deletedCount, errors.Tag(err)
-			}
-			deletedCount += int64(len(keys))
-		}
-		cursor = next
-		if cursor == 0 {
-			break
-		}
-	}
-	return deletedCount, nil
-}
-
-// scanDeletePatternConcurrent 顺序推进 SCAN 游标，并把扫描出的 key 批次交给多个 UNLINK worker。
-// jobs 通道按 worker 数限流，避免 Redis 返回大量 key 时在客户端堆积无界内存。
-func (s *RedisStore) scanDeletePatternConcurrent(ctx context.Context, client redis.UniversalClient, pattern string, count int64) (int64, error) {
-	// workerCount 表示单节点内并发 UNLINK worker 数；只加速删除阶段，不改变 SCAN 游标顺序语义。
-	workerCount := s.scanUnlinkConcurrency
-	if workerCount <= 1 {
-		return s.scanDeletePatternSerial(ctx, client, pattern, count)
-	}
-	// deletedCount 聚合 worker 删除数量；不同 worker 完成顺序不可预测，必须使用原子计数。
-	var deletedCount atomic.Int64
-	// groupCtx 在扫描或删除任一阶段失败时取消全链路，避免继续产生 Redis 压力。
-	group, groupCtx := errgroup.WithContext(ctx)
-	// jobs 是扫描到的 key 批次队列，容量按 worker 数限流，避免客户端因大 keyspace 堆积过多内存。
-	jobs := make(chan []string, workerCount)
-	for i := 0; i < workerCount; i++ {
-		group.Go(func() error {
-			for keys := range jobs {
-				if len(keys) == 0 {
-					continue
-				}
-				if err := s.unlinkKeys(groupCtx, client, keys); err != nil {
-					return errors.Tag(err)
-				}
-				deletedCount.Add(int64(len(keys)))
-			}
-			return nil
-		})
-	}
-	group.Go(func() error {
-		defer close(jobs)
-		// cursor 是 Redis SCAN 返回的游标，必须由单个扫描 goroutine 顺序推进到 0 才算完成。
-		cursor := uint64(0)
-		for {
-			keys, next, err := client.Scan(groupCtx, cursor, pattern, count).Result()
-			if err != nil {
-				return errors.Tag(err)
-			}
-			if len(keys) > 0 {
-				select {
-				case jobs <- keys:
-				case <-groupCtx.Done():
-					return errors.Tag(groupCtx.Err())
-				}
-			}
-			cursor = next
-			if cursor == 0 {
-				return nil
-			}
-		}
-	})
-	if err := group.Wait(); err != nil {
-		return deletedCount.Load(), errors.Tag(err)
-	}
-	return deletedCount.Load(), nil
-}
-
-// unlinkKeys 使用 Pipeline 单 key UNLINK，兼容 Redis Cluster 跨 slot 删除。
-func (s *RedisStore) unlinkKeys(ctx context.Context, client redis.UniversalClient, keys []string) error {
 	// chunkSize 控制单次 Pipeline 聚合的 UNLINK 命令数量，防止一次性提交过多 key 造成网络包和内存尖刺。
 	chunkSize := s.unlinkChunkSize
 	if chunkSize <= 0 {
 		chunkSize = defaultUnlinkChunkSize
 	}
+	var deleted int64
 	for start := 0; start < len(keys); start += chunkSize {
 		end := start + chunkSize
 		if end > len(keys) {
 			end = len(keys)
 		}
-		var finalCmds []pipelineCmd
-		// 即使 Exec 返回 nil，也要检查各命令的 Err，避免漏掉部分失败（集群/网络抖动下更常见）。
-		err := execPipelineWithRetry(ctx, s.pipelineRetries, func() error {
+		pending := append([]string(nil), keys[start:end]...) // pending 只保留尚未确认执行成功的 key，避免重试后重复计数
+		var lastErr error
+		retries := min(max(s.pipelineRetries, 0), maxPipelineRetries)
+		for attempt := 0; len(pending) > 0; attempt++ {
+			if attempt > 0 {
+				if err := waitWithContext(ctx, pipelineRetryDelay(attempt)); err != nil {
+					return deleted, errors.Tag(err)
+				}
+			}
 			pipe := client.Pipeline()
-			cmds := make([]pipelineCmd, 0, end-start)
-			for _, key := range keys[start:end] {
-				cmds = append(cmds, pipelineCmd{key: key, cmd: pipe.Unlink(ctx, key)})
+			cmds := make([]*redis.IntCmd, 0, len(pending))
+			for _, key := range pending {
+				cmds = append(cmds, pipe.Unlink(ctx, key))
 			}
-			finalCmds = cmds
 			_, execErr := pipe.Exec(ctx)
-			if execErr == nil {
-				for _, cmd := range cmds {
-					if cmd.cmd.Err() != nil {
-						execErr = cmd.cmd.Err()
-						break
+			if execErr != nil {
+				lastErr = execErr
+			}
+			next := make([]string, 0, len(pending))
+			for index, cmd := range cmds {
+				count, cmdErr := cmd.Result()
+				if cmdErr != nil || (execErr != nil && count == 0) {
+					lastErr = cmdErr
+					if lastErr == nil {
+						lastErr = execErr
 					}
+					next = append(next, pending[index])
+					continue
 				}
+				deleted += count
 			}
-			return errors.Tag(execErr)
-		})
-		if err != nil {
-			failed := make([]string, 0, 8)
-			for _, cmd := range finalCmds {
-				if cmd.cmd.Err() != nil {
-					failed = append(failed, cmd.key)
-				}
+			pending = next
+			if attempt >= retries {
+				break
 			}
-			return errors.Tag(&PipelineExecError{
+		}
+		if len(pending) > 0 {
+			if lastErr == nil {
+				lastErr = errors.Errorf("UNLINK命令执行状态未知")
+			}
+			return deleted, errors.Tag(&PipelineExecError{
 				Operation:  "unlink_keys",
-				FailedKeys: uniqueSortedKeys(failed),
-				Cause:      err,
+				FailedKeys: uniqueSortedKeys(pending),
+				Cause:      lastErr,
 			})
 		}
 	}
-	return nil
+	return deleted, nil
 }
 
 // Exists 判断 Redis key 是否存在。
 func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
-	if s == nil || s.client == nil {
-		return false, nil
+	if err := s.validate(); err != nil {
+		return false, errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -688,44 +560,40 @@ func (s *RedisStore) Exists(ctx context.Context, key string) (bool, error) {
 
 // ExistsMulti 批量判断 Redis key 是否存在，返回 map 只包含传入的有效 key。
 func (s *RedisStore) ExistsMulti(ctx context.Context, keys ...string) (map[string]bool, error) {
-	if s == nil || s.client == nil {
-		return map[string]bool{}, nil
+	if err := s.validate(); err != nil {
+		return nil, errors.Tag(err)
 	}
-	cleanKeys := make([]string, 0, len(keys)) // cleanKeys 表示清洗后的有效 key 列表（去空白）
-	for _, key := range keys {
-		key = strings.TrimSpace(key)
-		if key != "" {
-			cleanKeys = append(cleanKeys, key)
-		}
-	}
+	cleanKeys := uniqueSortedKeys(cleanRedisKeys(keys))
 	if len(cleanKeys) == 0 {
 		return map[string]bool{}, nil
 	}
-	// Pipeline 合并 Exists，减少高频等待轮询阶段的网络往返。
-	pipe := s.client.Pipeline() // pipe 用于合并多次 Exists，减少网络往返
-	cmds := make([]*redis.IntCmd, 0, len(cleanKeys))
-	for _, key := range cleanKeys {
-		cmds = append(cmds, pipe.Exists(ctx, key))
-	}
-	_, err := pipe.Exec(ctx)
-	if err != nil {
-		return nil, errors.Tag(err)
-	}
 	result := make(map[string]bool, len(cleanKeys))
-	for index, cmd := range cmds {
-		count, cmdErr := cmd.Result()
-		if cmdErr != nil {
-			return nil, errors.Tag(cmdErr)
+	// 每批固定上限，既合并高频等待轮询，也避免外部调用一次构造无界 Pipeline。
+	for start := 0; start < len(cleanKeys); start += defaultWriteBatchChunkSize {
+		end := min(start+defaultWriteBatchChunkSize, len(cleanKeys))
+		pipe := s.client.Pipeline()
+		cmds := make([]*redis.IntCmd, 0, end-start)
+		for _, key := range cleanKeys[start:end] {
+			cmds = append(cmds, pipe.Exists(ctx, key))
 		}
-		result[cleanKeys[index]] = count > 0
+		if _, err := pipe.Exec(ctx); err != nil {
+			return nil, errors.Tag(err)
+		}
+		for index, cmd := range cmds {
+			count, err := cmd.Result()
+			if err != nil {
+				return nil, errors.Tag(err)
+			}
+			result[cleanKeys[start+index]] = count > 0
+		}
 	}
 	return result, nil
 }
 
 // Read 按缓存类型读取 Redis 原始值。
 func (s *RedisStore) Read(ctx context.Context, key string, typ CacheType) (any, error) {
-	if s == nil || s.client == nil {
-		return nil, errors.Errorf("Redis客户端未初始化")
+	if err := s.validate(); err != nil {
+		return nil, errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -747,14 +615,116 @@ func (s *RedisStore) Read(ctx context.Context, key string, typ CacheType) (any, 
 	}
 }
 
+// readRefreshSnapshot 按 generation→业务值的固定顺序合并读穿热路径；不安全或未受限的集合回退通用 Store 路径。
+func (s *RedisStore) readRefreshSnapshot(ctx context.Context, key string, typ CacheType, fields []string, resultKey string) (refreshSnapshot, bool, error) {
+	if err := s.validate(); err != nil {
+		return refreshSnapshot{}, true, errors.Tag(err)
+	}
+	key = strings.TrimSpace(key)
+	resultKey = strings.TrimSpace(resultKey)
+	fields = uniqueSortedKeys(cleanRedisKeys(fields))
+	if key == "" || resultKey == "" {
+		return refreshSnapshot{}, true, errors.Errorf("读穿快照业务key和结果key不能为空")
+	}
+	if len(fields) > 0 && typ != TypeHash {
+		return refreshSnapshot{}, true, errors.Errorf("只有Hash读穿快照支持fields")
+	}
+	if len(fields) > 0 {
+		if err := s.validateReadPageOptions(ReadPageOptions{Fields: fields}); err != nil {
+			return refreshSnapshot{}, true, errors.Tag(err)
+		}
+	}
+	if s.knownDistributedClient() {
+		if err := validateSameRedisSlot([]string{resultKey, key}); err != nil {
+			return refreshSnapshot{}, true, errors.Tag(err)
+		}
+	}
+	switch {
+	case typ == TypeString:
+		pipe := s.client.Pipeline()
+		resultCmd := pipe.Get(ctx, resultKey)
+		valueCmd := pipe.Get(ctx, key)
+		_, execErr := pipe.Exec(ctx)
+		result, resultErr := resultCmd.Result()
+		if resultErr != nil && resultErr != redis.Nil {
+			return refreshSnapshot{}, true, errors.Tag(resultErr)
+		}
+		value, valueErr := valueCmd.Result()
+		if valueErr != nil && valueErr != redis.Nil {
+			return refreshSnapshot{}, true, errors.Tag(valueErr)
+		}
+		if execErr != nil && execErr != redis.Nil {
+			return refreshSnapshot{}, true, errors.Tag(execErr)
+		}
+		return refreshSnapshot{
+			Value:       value,
+			ValueReady:  valueErr == nil,
+			Result:      result,
+			ResultReady: resultErr == nil,
+		}, true, nil
+	case typ == TypeHash && len(fields) > 0:
+		pipe := s.client.Pipeline()
+		resultCmd := pipe.Get(ctx, resultKey)
+		valueCmd := pipe.HMGet(ctx, key, fields...)
+		_, execErr := pipe.Exec(ctx)
+		result, resultErr := resultCmd.Result()
+		if resultErr != nil && resultErr != redis.Nil {
+			return refreshSnapshot{}, true, errors.Tag(resultErr)
+		}
+		values, valueErr := valueCmd.Result()
+		if valueErr != nil {
+			return refreshSnapshot{}, true, errors.Tag(valueErr)
+		}
+		if execErr != nil && execErr != redis.Nil {
+			return refreshSnapshot{}, true, errors.Tag(execErr)
+		}
+		value := make(map[string]string, len(fields))
+		for index, item := range values {
+			if item != nil {
+				value[fields[index]] = redisValueToString(item)
+			}
+		}
+		return refreshSnapshot{
+			Value:       value,
+			ValueReady:  len(value) == len(fields),
+			Result:      result,
+			ResultReady: resultErr == nil,
+		}, true, nil
+	case isCollectionType(typ):
+		if s.maxCollectionReadCount <= 0 {
+			return refreshSnapshot{}, false, nil
+		}
+		values, valueReady, result, resultReady, err := s.readCollectionLimitedSnapshot(ctx, key, typ, resultKey)
+		if err != nil {
+			return refreshSnapshot{}, true, errors.Tag(err)
+		}
+		if !valueReady {
+			return refreshSnapshot{Result: result, ResultReady: resultReady}, true, nil
+		}
+		value, err := decodeCollectionValues(key, typ, values)
+		if err != nil {
+			return refreshSnapshot{}, true, errors.Tag(err)
+		}
+		return refreshSnapshot{Value: value, ValueReady: true, Result: result, ResultReady: resultReady}, true, nil
+	default:
+		return refreshSnapshot{}, true, errors.Errorf("不支持的Redis缓存类型: %s", typ)
+	}
+}
+
 // ReadPage 按缓存类型分页读取 Redis 原始值，避免大集合必须一次性全量读取。
 func (s *RedisStore) ReadPage(ctx context.Context, key string, typ CacheType, options ReadPageOptions) (ReadPageResult, error) {
-	if s == nil || s.client == nil {
-		return ReadPageResult{}, errors.Errorf("Redis客户端未初始化")
+	if err := s.validate(); err != nil {
+		return ReadPageResult{}, errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return ReadPageResult{}, errors.Tag(ErrCacheMiss)
+	}
+	if isCollectionType(typ) {
+		options.Fields = uniqueSortedKeys(cleanRedisKeys(options.Fields))
+		if err := s.validateReadPageOptions(options); err != nil {
+			return ReadPageResult{}, errors.Tag(err)
+		}
 	}
 	switch typ {
 	case TypeString:
@@ -776,29 +746,38 @@ func (s *RedisStore) ReadPage(ctx context.Context, key string, typ CacheType, op
 	}
 }
 
-// SetNX 设置 Redis 分布式轻量锁。
-func (s *RedisStore) SetNX(ctx context.Context, key string, value any, ttl time.Duration) (bool, error) {
-	if s == nil || s.client == nil {
-		return false, errors.Errorf("Redis客户端未初始化")
+// AcquireRefreshLock 原子获取刷新锁，失败时在同一脚本内返回当前owner。
+func (s *RedisStore) AcquireRefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, string, error) {
+	if err := s.validate(); err != nil {
+		return false, "", errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
-	if key == "" {
-		return false, errors.Errorf("Redis锁key不能为空")
+	value = strings.TrimSpace(value)
+	if key == "" || value == "" || ttl <= 0 {
+		return false, "", errors.Errorf("Redis刷新锁key、owner和TTL必须有效")
 	}
-	return s.client.SetNX(ctx, key, value, ttl).Result()
+	result, err := acquireRefreshLockScript.Run(ctx, s.client, []string{key}, value, ttlMilliseconds(ttl)).Slice()
+	if err != nil {
+		return false, "", errors.Tag(err)
+	}
+	if len(result) != 2 {
+		return false, "", errors.Errorf("Redis刷新锁脚本返回值无效")
+	}
+	locked := fmt.Sprint(result[0]) == "1"
+	return locked, fmt.Sprint(result[1]), nil
 }
 
 // RefreshLock 仅当锁值与持有者标识一致时续期锁。
 func (s *RedisStore) RefreshLock(ctx context.Context, key string, value string, ttl time.Duration) (bool, error) {
-	if s == nil || s.client == nil {
-		return false, nil
+	if err := s.validate(); err != nil {
+		return false, errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
 	if key == "" || value == "" || ttl <= 0 {
 		return false, nil
 	}
-	result, err := refreshLockScript.Run(ctx, s.client, []string{key}, value, ttl.Milliseconds()).Int64()
+	result, err := refreshLockScript.Run(ctx, s.client, []string{key}, value, ttlMilliseconds(ttl)).Int64()
 	if err != nil {
 		return false, errors.Tag(err)
 	}
@@ -807,8 +786,8 @@ func (s *RedisStore) RefreshLock(ctx context.Context, key string, value string, 
 
 // ReleaseLock 仅当锁值与持有者标识一致时释放锁，避免误删其它实例刚抢到的锁。
 func (s *RedisStore) ReleaseLock(ctx context.Context, key string, value string) (bool, error) {
-	if s == nil || s.client == nil {
-		return false, nil
+	if err := s.validate(); err != nil {
+		return false, errors.Tag(err)
 	}
 	key = strings.TrimSpace(key)
 	value = strings.TrimSpace(value)
@@ -822,25 +801,14 @@ func (s *RedisStore) ReleaseLock(ctx context.Context, key string, value string) 
 	return result > 0, nil
 }
 
-// Write 按 Entry 类型写入 Redis，并统一处理 TTL 抖动。
-func (s *RedisStore) Write(ctx context.Context, entry Entry) error {
-	if s == nil || s.client == nil {
-		return errors.Errorf("Redis客户端未初始化")
-	}
-	return s.WriteBatch(ctx, []Entry{entry})
-}
-
-// WriteBatch 使用 Redis Pipeline 批量写入缓存，降低大量 Entry 重建时的网络往返。
-func (s *RedisStore) WriteBatch(ctx context.Context, entries []Entry) error {
-	if s == nil || s.client == nil {
-		return errors.Errorf("Redis客户端未初始化")
-	}
+// writePreparedEntries 分批提交已完成编码和校验的写入计划。
+func (s *RedisStore) writePreparedEntries(ctx context.Context, entries []preparedEntry) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	retryable := entriesRetryable(entries)
+	retryable := preparedEntriesRetryable(entries)
 	// 分批提交避免单个 pipeline 过大导致的网络包过大、内存尖刺与 Redis 侧处理压力。
-	const chunkSize = 256
+	const chunkSize = defaultWriteBatchChunkSize
 	for start := 0; start < len(entries); start += chunkSize {
 		end := start + chunkSize
 		if end > len(entries) {
@@ -854,11 +822,9 @@ func (s *RedisStore) WriteBatch(ctx context.Context, entries []Entry) error {
 		}
 		err := execPipelineWithRetry(ctx, retries, func() error {
 			pipe := s.client.Pipeline()
-			cmds := make([]pipelineCmd, 0, (end-start)*3)
+			cmds := make([]pipelineCmd, 0, end-start)
 			for _, entry := range entries[start:end] {
-				if err := s.enqueueWrite(ctx, pipe, entry, &cmds); err != nil {
-					return errors.Tag(err)
-				}
+				s.enqueuePreparedWrite(ctx, pipe, entry, &cmds)
 			}
 			finalCmds = cmds
 			return execAndCheckPipeline(ctx, pipe, cmds)
@@ -874,61 +840,166 @@ func (s *RedisStore) WriteBatch(ctx context.Context, entries []Entry) error {
 	return nil
 }
 
-// entriesRetryable 判断当前批量写是否允许自动重试。
-// 仅对“默认覆盖写”开放重试，避免 Overwrite=false 的增量写重复执行导致语义放大。
-func entriesRetryable(entries []Entry) bool {
+// preparedEntriesRetryable 判断当前批量写是否允许自动重试。
+func preparedEntriesRetryable(entries []preparedEntry) bool {
 	for _, entry := range entries {
-		if !entryShouldOverwrite(entry) {
+		if !entry.overwrite {
 			return false
 		}
 	}
 	return true
 }
 
-// validateWriteEntries 在执行可能有删除副作用的合并变更前预先校验写入项，避免先删旧缓存再发现新值不可写。
-func (s *RedisStore) validateWriteEntries(entries []Entry) error {
+// prepareWriteEntries 在首条 Redis 命令前一次性完成所有值编码、边界校验和 TTL 计算。
+func (s *RedisStore) prepareWriteEntries(entries []Entry) ([]preparedEntry, error) {
+	prepared := make([]preparedEntry, 0, len(entries))
 	for _, entry := range entries {
-		if err := s.validateWriteEntry(entry); err != nil {
-			return errors.Tag(err)
+		item, err := s.prepareWriteEntry(entry)
+		if err != nil {
+			return nil, errors.Tag(err)
 		}
+		prepared = append(prepared, item)
 	}
-	return nil
+	return prepared, nil
 }
 
-// validateWriteEntry 复用写入路径的类型归一化逻辑，只做本地校验，不向 Redis 发送命令。
-func (s *RedisStore) validateWriteEntry(entry Entry) error {
+// prepareWriteEntry 把单条 Entry 转换为可直接提交的写入计划。
+func (s *RedisStore) prepareWriteEntry(entry Entry) (preparedEntry, error) {
 	entry.Key = strings.TrimSpace(entry.Key)
 	if entry.Key == "" {
-		return errors.Errorf("Redis缓存key不能为空")
+		return preparedEntry{}, errors.Errorf("Redis缓存key不能为空")
 	}
 	if err := validateRedisClusterHashTagKey(entry.Key); err != nil {
-		return errors.Tag(err)
+		return preparedEntry{}, errors.Tag(err)
+	}
+	if err := validateEntryTTL(entry, s.defaultJitterRatio); err != nil {
+		return preparedEntry{}, errors.Tag(err)
+	}
+	prepared := preparedEntry{
+		key:       entry.Key,
+		typ:       entry.Type,
+		ttl:       jitterDurationWithDefault(entry.TTL, entry.Jitter, s.defaultJitterRatio),
+		overwrite: entryShouldOverwrite(entry),
+	}
+	if (prepared.typ == TypeString || prepared.typ == TypeList) && !prepared.overwrite {
+		return preparedEntry{}, errors.Wrapf(ErrInvalidConfig, "缓存key[%s]的类型[%s]不支持增量写入", entry.Key, entry.Type)
+	}
+	if count, ok := rawCollectionInputCount(entry.Type, entry.Value); ok {
+		if err := s.ensureCollectionWriteCount(entry.Key, entry.Type, count); err != nil {
+			return preparedEntry{}, errors.Tag(err)
+		}
 	}
 	switch entry.Type {
 	case TypeString:
-		_, err := s.encodeString(entry.Value)
-		return errors.Tag(err)
+		value, err := s.encodeString(entry.Value)
+		prepared.stringValue = value
+		return prepared, errors.Tag(err)
 	case TypeHash:
 		values, err := s.normalizeMap(entry.Value)
 		if err != nil {
-			return errors.Tag(err)
+			return preparedEntry{}, errors.Tag(err)
 		}
-		return errors.Tag(s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)))
+		prepared.mapValues = values
+		return prepared, nil
 	case TypeList, TypeSet:
 		values, err := s.normalizeSlice(entry.Value)
 		if err != nil {
-			return errors.Tag(err)
+			return preparedEntry{}, errors.Tag(err)
 		}
-		return errors.Tag(s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)))
+		prepared.values = values
+		return prepared, nil
 	case TypeZSet:
 		values, err := s.normalizeZSet(entry.Value)
 		if err != nil {
-			return errors.Tag(err)
+			return preparedEntry{}, errors.Tag(err)
 		}
-		return errors.Tag(s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)))
+		prepared.zValues = values
+		return prepared, nil
 	default:
-		return errors.Errorf("不支持的Redis缓存类型: %s", entry.Type)
+		return preparedEntry{}, errors.Errorf("不支持的Redis缓存类型: %s", entry.Type)
 	}
+}
+
+// rawCollectionInputCount 在编码和复制前 O(1) 读取合法集合容器规模。
+func rawCollectionInputCount(typ CacheType, value any) (int, bool) {
+	if value == nil {
+		return 0, true
+	}
+	switch typ {
+	case TypeHash:
+		input := reflect.ValueOf(value)
+		if input.Kind() == reflect.Map {
+			return input.Len(), true
+		}
+	case TypeList, TypeSet:
+		input := reflect.ValueOf(value)
+		if input.Kind() == reflect.Slice || input.Kind() == reflect.Array {
+			return input.Len(), true
+		}
+	case TypeZSet:
+		switch input := value.(type) {
+		case []ZMember:
+			return len(input), true
+		case map[string]float64:
+			return len(input), true
+		}
+	}
+	return 0, false
+}
+
+// enqueuePreparedWrite 把已准备的单条写入加入 Pipeline。
+func (s *RedisStore) enqueuePreparedWrite(ctx context.Context, pipe redis.Pipeliner, entry preparedEntry, cmds *[]pipelineCmd) {
+	if entry.typ == TypeString {
+		cmd := pipe.Set(ctx, entry.key, entry.stringValue, entry.ttl)
+		*cmds = append(*cmds, pipelineCmd{key: entry.key, cmd: cmd})
+		return
+	}
+	values := entry.values
+	if entry.typ == TypeHash {
+		values = make([]any, 0, len(entry.mapValues)*2)
+		for field, value := range entry.mapValues {
+			values = append(values, field, value)
+		}
+	} else if entry.typ == TypeZSet {
+		values = make([]any, 0, len(entry.zValues)*2)
+		for _, value := range entry.zValues {
+			values = append(values, value.Score, value.Member)
+		}
+	}
+	if entry.overwrite {
+		s.enqueueCollectionReplace(ctx, pipe, entry.key, entry.typ, entry.ttl, values, cmds)
+		return
+	}
+	s.enqueueCollectionMutation(ctx, pipe, entry.key, entry.typ, entry.ttl, values, cmds)
+}
+
+// validateEntryTTL 校验基础 TTL、显式抖动和默认抖动不会产生非法时长。
+func validateEntryTTL(entry Entry, defaultRatio float64) error {
+	if entry.TTL < 0 || entry.Jitter < 0 {
+		return errors.Errorf("缓存TTL和Jitter不能为负数")
+	}
+	if entry.TTL == 0 && entry.Jitter > 0 {
+		return errors.Errorf("永久缓存不能配置Jitter")
+	}
+	if entry.TTL == 0 {
+		return nil
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	jitter := entry.Jitter
+	if jitter == 0 && defaultRatio > 0 {
+		if math.IsNaN(defaultRatio) || math.IsInf(defaultRatio, 0) {
+			return errors.Errorf("默认TTL抖动比例必须是有限数")
+		}
+		jitterValue := float64(entry.TTL) * defaultRatio
+		if jitterValue > float64(maxDuration-entry.TTL) {
+			return errors.Errorf("缓存TTL与默认Jitter相加溢出")
+		}
+		jitter = time.Duration(jitterValue)
+	}
+	if jitter > maxDuration-entry.TTL {
+		return errors.Errorf("缓存TTL与Jitter相加溢出")
+	}
+	return nil
 }
 
 // execAndCheckPipeline 执行 Pipeline 并检查每条命令错误，避免 Exec 返回 nil 但单命令失败被遗漏。
@@ -961,11 +1032,9 @@ func failedPipelineKeys(cmds []pipelineCmd) []string {
 
 // execPipelineWithRetry 对可安全重试的 pipeline 做轻量重试，吸收瞬时网络/路由抖动。
 func execPipelineWithRetry(ctx context.Context, retries int, exec func() error) error {
-	if retries < 0 {
-		retries = 0
-	}
+	retries = min(max(retries, 0), maxPipelineRetries)
 	var lastErr error
-	for attempt := 0; attempt <= retries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
 			if err := waitWithContext(ctx, pipelineRetryDelay(attempt)); err != nil {
 				return errors.Tag(err)
@@ -973,6 +1042,9 @@ func execPipelineWithRetry(ctx context.Context, retries int, exec func() error) 
 		}
 		if err := exec(); err != nil {
 			lastErr = err
+			if attempt >= retries {
+				break
+			}
 			continue
 		}
 		return nil
@@ -992,148 +1064,32 @@ func pipelineRetryDelay(attempt int) time.Duration {
 	return delay
 }
 
-// enqueueWrite 把单条缓存写入命令追加到 Pipeline。
-func (s *RedisStore) enqueueWrite(ctx context.Context, pipe redis.Pipeliner, entry Entry, cmds *[]pipelineCmd) error {
-	entry.Key = strings.TrimSpace(entry.Key)
-	if entry.Key == "" {
-		return errors.Errorf("Redis缓存key不能为空")
-	}
-	ttl := jitterDurationWithDefault(entry.TTL, entry.Jitter, s.defaultJitterRatio)
-	switch entry.Type {
-	case TypeString:
-		return s.enqueueString(ctx, pipe, entry, ttl, cmds)
-	case TypeHash:
-		return s.enqueueHash(ctx, pipe, entry, ttl, cmds)
-	case TypeList:
-		return s.enqueueList(ctx, pipe, entry, ttl, cmds)
-	case TypeSet:
-		return s.enqueueSet(ctx, pipe, entry, ttl, cmds)
-	case TypeZSet:
-		return s.enqueueZSet(ctx, pipe, entry, ttl, cmds)
-	default:
-		return errors.Errorf("不支持的Redis缓存类型: %s", entry.Type)
-	}
+// enqueueCollectionMutation 使用单 key Lua 原子提交增量集合写入与TTL语义。
+func (s *RedisStore) enqueueCollectionMutation(ctx context.Context, pipe redis.Pipeliner, key string, typ CacheType, ttl time.Duration, values []any, cmds *[]pipelineCmd) {
+	args := make([]any, 0, len(values)+2)
+	args = append(args, string(typ), ttlMilliseconds(ttl))
+	args = append(args, values...)
+	cmd := pipe.Eval(ctx, mutateCollectionScript, []string{key}, args...)
+	*cmds = append(*cmds, pipelineCmd{key: key, cmd: cmd})
 }
 
-// enqueueString 追加 String 缓存写入命令。
-func (s *RedisStore) enqueueString(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
-	value, err := s.encodeString(entry.Value)
-	if err != nil {
-		return errors.Tag(err)
-	}
-	cmd := pipe.Set(ctx, entry.Key, value, ttl)
-	*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
-	return nil
-}
-
-// enqueueHash 追加 Hash 缓存写入命令。
-func (s *RedisStore) enqueueHash(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
-	values, err := s.normalizeMap(entry.Value)
-	if err != nil {
-		return errors.Tag(err)
-	}
-	if err := s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)); err != nil {
-		return errors.Tag(err)
-	}
-	if entryShouldOverwrite(entry) {
-		args := make([]any, 0, len(values)*2)
-		for field, value := range values {
-			args = append(args, field, value)
-		}
-		s.enqueueCollectionReplace(ctx, pipe, entry.Key, entry.Type, ttl, args, cmds)
-		return nil
-	}
-	if len(values) > 0 {
-		cmd := pipe.HSet(ctx, entry.Key, values)
-		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
-	}
-	s.enqueueExpire(ctx, pipe, entry.Key, ttl, cmds)
-	return nil
-}
-
-// enqueueList 追加 List 缓存写入命令。
-func (s *RedisStore) enqueueList(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
-	values, err := s.normalizeSlice(entry.Value)
-	if err != nil {
-		return errors.Tag(err)
-	}
-	if err := s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)); err != nil {
-		return errors.Tag(err)
-	}
-	if entryShouldOverwrite(entry) {
-		s.enqueueCollectionReplace(ctx, pipe, entry.Key, entry.Type, ttl, values, cmds)
-		return nil
-	}
-	if len(values) > 0 {
-		cmd := pipe.RPush(ctx, entry.Key, values...)
-		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
-	}
-	s.enqueueExpire(ctx, pipe, entry.Key, ttl, cmds)
-	return nil
-}
-
-// enqueueSet 追加 Set 缓存写入命令。
-func (s *RedisStore) enqueueSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
-	values, err := s.normalizeSlice(entry.Value)
-	if err != nil {
-		return errors.Tag(err)
-	}
-	if err := s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)); err != nil {
-		return errors.Tag(err)
-	}
-	if entryShouldOverwrite(entry) {
-		s.enqueueCollectionReplace(ctx, pipe, entry.Key, entry.Type, ttl, values, cmds)
-		return nil
-	}
-	if len(values) > 0 {
-		cmd := pipe.SAdd(ctx, entry.Key, values...)
-		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
-	}
-	s.enqueueExpire(ctx, pipe, entry.Key, ttl, cmds)
-	return nil
-}
-
-// enqueueZSet 追加 ZSet 缓存写入命令。
-func (s *RedisStore) enqueueZSet(ctx context.Context, pipe redis.Pipeliner, entry Entry, ttl time.Duration, cmds *[]pipelineCmd) error {
-	values, err := s.normalizeZSet(entry.Value)
-	if err != nil {
-		return errors.Tag(err)
-	}
-	if err := s.ensureCollectionWriteCount(entry.Key, entry.Type, len(values)); err != nil {
-		return errors.Tag(err)
-	}
-	if entryShouldOverwrite(entry) {
-		args := make([]any, 0, len(values)*2)
-		for _, value := range values {
-			args = append(args, value.Score, value.Member)
-		}
-		s.enqueueCollectionReplace(ctx, pipe, entry.Key, entry.Type, ttl, args, cmds)
-		return nil
-	}
-	if len(values) > 0 {
-		cmd := pipe.ZAdd(ctx, entry.Key, values...)
-		*cmds = append(*cmds, pipelineCmd{key: entry.Key, cmd: cmd})
-	}
-	s.enqueueExpire(ctx, pipe, entry.Key, ttl, cmds)
-	return nil
-}
-
-// enqueueCollectionReplace 使用单 key Lua 脚本原子覆盖集合结构，避免读到删除后尚未重建的半状态。
+// enqueueCollectionReplace 先在同槽临时 key 构建集合，再由 Lua 原子替换目标 key。
 func (s *RedisStore) enqueueCollectionReplace(ctx context.Context, pipe redis.Pipeliner, key string, typ CacheType, ttl time.Duration, values []any, cmds *[]pipelineCmd) {
 	args := make([]any, 0, len(values)+2)
 	args = append(args, string(typ), ttlMilliseconds(ttl))
 	args = append(args, values...)
-	cmd := pipe.Eval(ctx, replaceCollectionScript, []string{key}, args...)
+	temporaryKey := collectionReplaceTempKey(key)
+	cmd := pipe.Eval(ctx, replaceCollectionScript, []string{key, temporaryKey}, args...)
 	*cmds = append(*cmds, pipelineCmd{key: key, cmd: cmd})
 }
 
-// enqueueExpire 追加过期时间设置；ttl<=0 表示保留 Redis 默认的永久 key 语义。
-func (s *RedisStore) enqueueExpire(ctx context.Context, pipe redis.Pipeliner, key string, ttl time.Duration, cmds *[]pipelineCmd) {
-	if ttl <= 0 {
-		return
+// collectionReplaceTempKey 生成与目标同槽且低碰撞的集合替换临时 key。
+func collectionReplaceTempKey(key string) string {
+	var token uint64
+	if err := binary.Read(rand.Reader, binary.LittleEndian, &token); err != nil {
+		token = uint64(time.Now().UnixNano()) ^ collectionReplaceSeq.Add(1)
 	}
-	cmd := pipe.Expire(ctx, key, ttl)
-	*cmds = append(*cmds, pipelineCmd{key: key, cmd: cmd})
+	return tablecacheMetaKey(fmt.Sprintf("replace:%016x", token), key)
 }
 
 // readString 读取 String 缓存。
@@ -1145,12 +1101,76 @@ func (s *RedisStore) readString(ctx context.Context, key string) (string, error)
 	return value, errors.Tag(err)
 }
 
+// readCollectionLimited 在一个 Lua 执行边界内检查成员数并读取集合，避免检查后并发增长绕过上限。
+func (s *RedisStore) readCollectionLimited(ctx context.Context, key string, typ CacheType) ([]any, error) {
+	values, ready, _, _, err := s.readCollectionLimitedSnapshot(ctx, key, typ, "")
+	if err != nil {
+		return nil, errors.Tag(err)
+	}
+	if !ready {
+		return nil, errors.Tag(ErrCacheMiss)
+	}
+	return values, nil
+}
+
+// readCollectionLimitedSnapshot 原子读取可选完成代际，并在同一 Lua 边界内限制集合规模。
+func (s *RedisStore) readCollectionLimitedSnapshot(ctx context.Context, key string, typ CacheType, resultKey string) ([]any, bool, string, bool, error) {
+	keys := []string{key}
+	if resultKey != "" {
+		keys = append(keys, resultKey)
+	}
+	result, err := readCollectionLimitedScript.Run(ctx, s.client, keys, string(typ), s.maxCollectionReadCount).Slice()
+	if err != nil {
+		return nil, false, "", false, errors.Tag(err)
+	}
+	if len(result) < 2 {
+		return nil, false, "", false, errors.Errorf("缓存key[%s]集合受限读取返回值无效", key)
+	}
+	generation, generationReady := redisOptionalString(result[1])
+	switch redisValueToString(result[0]) {
+	case collectionReadStateMiss:
+		if len(result) != 2 {
+			return nil, false, "", false, errors.Errorf("缓存key[%s]集合未命中返回值无效", key)
+		}
+		return nil, false, generation, generationReady, nil
+	case collectionReadStateTooLarge:
+		if len(result) != 3 {
+			return nil, false, "", false, errors.Errorf("缓存key[%s]集合超限返回值无效", key)
+		}
+		size, parseErr := strconv.ParseInt(redisValueToString(result[2]), 10, 64)
+		if parseErr != nil {
+			return nil, false, "", false, errors.Wrapf(parseErr, "缓存key[%s]集合成员数返回值无效", key)
+		}
+		return nil, false, "", false, errors.Wrapf(ErrCollectionTooLarge, "缓存key[%s]集合成员数[%d]超过读取上限[%d]", key, size, s.maxCollectionReadCount)
+	case collectionReadStateHit:
+		if len(result) != 3 {
+			return nil, false, "", false, errors.Errorf("缓存key[%s]集合读取返回值无效", key)
+		}
+		values, ok := result[2].([]any)
+		if !ok {
+			return nil, false, "", false, errors.Errorf("缓存key[%s]集合读取结果类型错误", key)
+		}
+		return values, true, generation, generationReady, nil
+	default:
+		return nil, false, "", false, errors.Errorf("缓存key[%s]集合读取状态无效", key)
+	}
+}
+
 // readHash 读取 Hash 缓存。
 func (s *RedisStore) readHash(ctx context.Context, key string) (map[string]string, error) {
-	if size, err := s.ensureCollectionReadCount(ctx, key, TypeHash); err != nil {
-		return nil, errors.Tag(err)
-	} else if size == 0 {
-		return nil, errors.Tag(ErrCacheMiss)
+	if s.maxCollectionReadCount > 0 {
+		values, err := s.readCollectionLimited(ctx, key, TypeHash)
+		if err != nil {
+			return nil, errors.Tag(err)
+		}
+		if len(values)%2 != 0 {
+			return nil, errors.Errorf("缓存key[%s]Hash读取结果字段不完整", key)
+		}
+		result := make(map[string]string, len(values)/2)
+		for index := 0; index < len(values); index += 2 {
+			result[redisValueToString(values[index])] = redisValueToString(values[index+1])
+		}
+		return result, nil
 	}
 	value, err := s.client.HGetAll(ctx, key).Result()
 	if err != nil {
@@ -1164,10 +1184,16 @@ func (s *RedisStore) readHash(ctx context.Context, key string) (map[string]strin
 
 // readList 读取 List 缓存。
 func (s *RedisStore) readList(ctx context.Context, key string) ([]string, error) {
-	if size, err := s.ensureCollectionReadCount(ctx, key, TypeList); err != nil {
-		return nil, errors.Tag(err)
-	} else if size == 0 {
-		return nil, errors.Tag(ErrCacheMiss)
+	if s.maxCollectionReadCount > 0 {
+		values, err := s.readCollectionLimited(ctx, key, TypeList)
+		if err != nil {
+			return nil, errors.Tag(err)
+		}
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			result = append(result, redisValueToString(value))
+		}
+		return result, nil
 	}
 	value, err := s.client.LRange(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -1181,10 +1207,16 @@ func (s *RedisStore) readList(ctx context.Context, key string) ([]string, error)
 
 // readSet 读取 Set 缓存。
 func (s *RedisStore) readSet(ctx context.Context, key string) ([]string, error) {
-	if size, err := s.ensureCollectionReadCount(ctx, key, TypeSet); err != nil {
-		return nil, errors.Tag(err)
-	} else if size == 0 {
-		return nil, errors.Tag(ErrCacheMiss)
+	if s.maxCollectionReadCount > 0 {
+		values, err := s.readCollectionLimited(ctx, key, TypeSet)
+		if err != nil {
+			return nil, errors.Tag(err)
+		}
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			result = append(result, redisValueToString(value))
+		}
+		return result, nil
 	}
 	value, err := s.client.SMembers(ctx, key).Result()
 	if err != nil {
@@ -1198,10 +1230,23 @@ func (s *RedisStore) readSet(ctx context.Context, key string) ([]string, error) 
 
 // readZSet 读取 ZSet 缓存。
 func (s *RedisStore) readZSet(ctx context.Context, key string) ([]ZMember, error) {
-	if size, err := s.ensureCollectionReadCount(ctx, key, TypeZSet); err != nil {
-		return nil, errors.Tag(err)
-	} else if size == 0 {
-		return nil, errors.Tag(ErrCacheMiss)
+	if s.maxCollectionReadCount > 0 {
+		values, err := s.readCollectionLimited(ctx, key, TypeZSet)
+		if err != nil {
+			return nil, errors.Tag(err)
+		}
+		if len(values)%2 != 0 {
+			return nil, errors.Errorf("缓存key[%s]ZSet读取结果成员不完整", key)
+		}
+		result := make([]ZMember, 0, len(values)/2)
+		for index := 0; index < len(values); index += 2 {
+			score, parseErr := strconv.ParseFloat(redisValueToString(values[index+1]), 64)
+			if parseErr != nil {
+				return nil, errors.Wrapf(parseErr, "缓存key[%s]ZSet分数返回值无效", key)
+			}
+			result = append(result, ZMember{Member: redisValueToString(values[index]), Score: score})
+		}
+		return result, nil
 	}
 	value, err := s.client.ZRangeWithScores(ctx, key, 0, -1).Result()
 	if err != nil {
@@ -1219,7 +1264,7 @@ func (s *RedisStore) readZSet(ctx context.Context, key string) ([]ZMember, error
 
 // readHashPage 分页读取 Hash；指定 Fields 时优先读取固定字段。
 func (s *RedisStore) readHashPage(ctx context.Context, key string, options ReadPageOptions) (ReadPageResult, error) {
-	fields := cleanRedisKeys(options.Fields)
+	fields := options.Fields
 	if len(fields) > 0 {
 		values, err := s.client.HMGet(ctx, key, fields...).Result()
 		if err != nil {
@@ -1237,15 +1282,15 @@ func (s *RedisStore) readHashPage(ctx context.Context, key string, options ReadP
 		}
 		return ReadPageResult{Value: result}, nil
 	}
-	count := options.Count
-	if count <= 0 {
-		count = defaultScanCount
-	}
+	count := s.readPageCount(options.Count)
 	values, cursor, err := s.client.HScan(ctx, key, options.Cursor, options.Match, count).Result()
 	if err != nil {
 		return ReadPageResult{}, errors.Tag(err)
 	}
 	result := make(map[string]string, len(values)/2)
+	if int64(len(values)/2) > s.collectionPageLimit() {
+		return ReadPageResult{}, errors.Wrapf(ErrCollectionTooLarge, "缓存key[%s]Hash分页结果超过上限[%d]", key, s.collectionPageLimit())
+	}
 	for index := 0; index+1 < len(values); index += 2 {
 		result[values[index]] = values[index+1]
 	}
@@ -1257,7 +1302,10 @@ func (s *RedisStore) readHashPage(ctx context.Context, key string, options ReadP
 
 // readListPage 分页读取 List。
 func (s *RedisStore) readListPage(ctx context.Context, key string, options ReadPageOptions) (ReadPageResult, error) {
-	start, stop := normalizeRange(options)
+	start, stop, err := s.normalizeRange(options)
+	if err != nil {
+		return ReadPageResult{}, errors.Tag(err)
+	}
 	values, err := s.client.LRange(ctx, key, start, stop).Result()
 	if err != nil {
 		return ReadPageResult{}, errors.Tag(err)
@@ -1270,10 +1318,7 @@ func (s *RedisStore) readListPage(ctx context.Context, key string, options ReadP
 
 // readSetPage 使用 SSCAN 分页读取 Set。
 func (s *RedisStore) readSetPage(ctx context.Context, key string, options ReadPageOptions) (ReadPageResult, error) {
-	count := options.Count
-	if count <= 0 {
-		count = defaultScanCount
-	}
+	count := s.readPageCount(options.Count)
 	values, cursor, err := s.client.SScan(ctx, key, options.Cursor, options.Match, count).Result()
 	if err != nil {
 		return ReadPageResult{}, errors.Tag(err)
@@ -1281,12 +1326,18 @@ func (s *RedisStore) readSetPage(ctx context.Context, key string, options ReadPa
 	if len(values) == 0 && cursor == 0 {
 		return ReadPageResult{}, errors.Tag(ErrCacheMiss)
 	}
+	if int64(len(values)) > s.collectionPageLimit() {
+		return ReadPageResult{}, errors.Wrapf(ErrCollectionTooLarge, "缓存key[%s]Set分页结果超过上限[%d]", key, s.collectionPageLimit())
+	}
 	return ReadPageResult{Value: values, Cursor: cursor}, nil
 }
 
 // readZSetPage 分页读取 ZSet。
 func (s *RedisStore) readZSetPage(ctx context.Context, key string, options ReadPageOptions) (ReadPageResult, error) {
-	start, stop := normalizeRange(options)
+	start, stop, err := s.normalizeRange(options)
+	if err != nil {
+		return ReadPageResult{}, errors.Tag(err)
+	}
 	values, err := s.client.ZRangeWithScores(ctx, key, start, stop).Result()
 	if err != nil {
 		return ReadPageResult{}, errors.Tag(err)
@@ -1301,18 +1352,60 @@ func (s *RedisStore) readZSetPage(ctx context.Context, key string, options ReadP
 	return ReadPageResult{Value: result}, nil
 }
 
-// normalizeRange 收敛范围读取参数；Stop 未显式设置时按 Count 或默认页大小生成右边界。
-func normalizeRange(options ReadPageOptions) (int64, int64) {
+// normalizeRange 收敛范围读取参数，并拒绝负数或超过单页上限的范围。
+func (s *RedisStore) normalizeRange(options ReadPageOptions) (int64, int64, error) {
 	start := options.Start
+	if start < 0 || options.Stop < 0 {
+		return 0, 0, errors.Errorf("集合分页范围不能为负数")
+	}
 	stop := options.Stop
 	if stop == 0 {
-		count := options.Count
-		if count <= 0 {
-			count = defaultScanCount
+		count := s.readPageCount(options.Count)
+		const maxInt64 = int64(1<<63 - 1)
+		if count-1 > maxInt64-start {
+			return 0, 0, errors.Wrapf(ErrCollectionTooLarge, "集合分页范围计算溢出")
 		}
 		stop = start + count - 1
 	}
-	return start, stop
+	if stop < start {
+		return 0, 0, errors.Errorf("集合分页Stop不能小于Start")
+	}
+	limit := s.collectionPageLimit()
+	if stop-start >= limit {
+		return 0, 0, errors.Wrapf(ErrCollectionTooLarge, "集合分页范围超过单页上限[%d]", limit)
+	}
+	return start, stop, nil
+}
+
+// validateReadPageOptions 校验集合分页参数不超过硬上限。
+func (s *RedisStore) validateReadPageOptions(options ReadPageOptions) error {
+	limit := s.collectionPageLimit()
+	if options.Count > limit {
+		return errors.Wrapf(ErrCollectionTooLarge, "集合分页Count[%d]超过单页上限[%d]", options.Count, limit)
+	}
+	if int64(len(options.Fields)) > limit {
+		return errors.Wrapf(ErrCollectionTooLarge, "Hash分页Fields数量超过单页上限[%d]", limit)
+	}
+	if options.Start < 0 || options.Stop < 0 {
+		return errors.Errorf("集合分页范围不能为负数")
+	}
+	return nil
+}
+
+// collectionPageLimit 返回集合分页读取的单页硬上限。
+func (s *RedisStore) collectionPageLimit() int64 {
+	if s.maxCollectionReadCount > 0 {
+		return s.maxCollectionReadCount
+	}
+	return defaultCollectionPageCount
+}
+
+// readPageCount 返回调用方请求或默认收敛后的分页数量。
+func (s *RedisStore) readPageCount(count int64) int64 {
+	if count > 0 {
+		return count
+	}
+	return min(defaultScanCount, s.collectionPageLimit())
 }
 
 // redisValueToString 把 HMGET 返回值转换成字符串。
@@ -1327,19 +1420,51 @@ func redisValueToString(value any) string {
 	}
 }
 
-// ensureCollectionReadCount 在全量集合读取前检查成员数，避免线上误读超大集合。
-func (s *RedisStore) ensureCollectionReadCount(ctx context.Context, key string, typ CacheType) (int64, error) {
-	if s.maxCollectionReadCount <= 0 {
-		return -1, nil
+// redisOptionalString 解析 Redis 可空字符串结果。
+func redisOptionalString(value any) (string, bool) {
+	if value == nil {
+		return "", false
 	}
-	size, err := s.collectionSize(ctx, key, typ)
-	if err != nil {
-		return 0, errors.Tag(err)
+	if flag, ok := value.(bool); ok && !flag {
+		return "", false
 	}
-	if size > s.maxCollectionReadCount {
-		return size, errors.Wrapf(ErrCollectionTooLarge, "缓存key[%s]集合成员数[%d]超过读取上限[%d]", key, size, s.maxCollectionReadCount)
+	return redisValueToString(value), true
+}
+
+// decodeCollectionValues 把受限集合脚本的扁平结果转换成公开读取值。
+func decodeCollectionValues(key string, typ CacheType, values []any) (any, error) {
+	switch typ {
+	case TypeHash:
+		if len(values)%2 != 0 {
+			return nil, errors.Errorf("缓存key[%s]Hash读取结果字段不完整", key)
+		}
+		result := make(map[string]string, len(values)/2)
+		for index := 0; index < len(values); index += 2 {
+			result[redisValueToString(values[index])] = redisValueToString(values[index+1])
+		}
+		return result, nil
+	case TypeList, TypeSet:
+		result := make([]string, 0, len(values))
+		for _, value := range values {
+			result = append(result, redisValueToString(value))
+		}
+		return result, nil
+	case TypeZSet:
+		if len(values)%2 != 0 {
+			return nil, errors.Errorf("缓存key[%s]ZSet读取结果成员不完整", key)
+		}
+		result := make([]ZMember, 0, len(values)/2)
+		for index := 0; index < len(values); index += 2 {
+			score, err := strconv.ParseFloat(redisValueToString(values[index+1]), 64)
+			if err != nil {
+				return nil, errors.Wrapf(err, "缓存key[%s]ZSet分数返回值无效", key)
+			}
+			result = append(result, ZMember{Member: redisValueToString(values[index]), Score: score})
+		}
+		return result, nil
+	default:
+		return nil, errors.Errorf("不支持的Redis集合类型: %s", typ)
 	}
-	return size, nil
 }
 
 // ensureCollectionWriteCount 检查单 Entry 集合写入规模。
@@ -1351,22 +1476,6 @@ func (s *RedisStore) ensureCollectionWriteCount(key string, typ CacheType, count
 		return errors.Wrapf(ErrCollectionTooLarge, "缓存key[%s]集合成员数[%d]超过写入上限[%d]", key, count, s.maxCollectionWriteCount)
 	}
 	return nil
-}
-
-// collectionSize 返回 Redis 集合当前成员数。
-func (s *RedisStore) collectionSize(ctx context.Context, key string, typ CacheType) (int64, error) {
-	switch typ {
-	case TypeHash:
-		return s.client.HLen(ctx, key).Result()
-	case TypeList:
-		return s.client.LLen(ctx, key).Result()
-	case TypeSet:
-		return s.client.SCard(ctx, key).Result()
-	case TypeZSet:
-		return s.client.ZCard(ctx, key).Result()
-	default:
-		return 0, errors.Errorf("不支持的Redis缓存类型: %s", typ)
-	}
 }
 
 // encodeString 把 String 缓存值转换成字符串，复杂结构统一 JSON 化。
@@ -1403,13 +1512,16 @@ func (s *RedisStore) normalizeMap(value any) (map[string]any, error) {
 	if refValue.Kind() != reflect.Map {
 		return nil, errors.Errorf("Hash缓存值必须是map结构")
 	}
+	if refValue.Type().Key().Kind() != reflect.String {
+		return nil, errors.Errorf("Hash缓存值必须使用字符串类型的map key")
+	}
 	result := make(map[string]any, refValue.Len())
 	for _, mapKey := range refValue.MapKeys() {
 		item, err := s.encodeRedisValue(refValue.MapIndex(mapKey).Interface())
 		if err != nil {
 			return nil, errors.Tag(err)
 		}
-		result[fmt.Sprint(mapKey.Interface())] = item
+		result[mapKey.String()] = item
 	}
 	return result, nil
 }
@@ -1485,6 +1597,9 @@ func (s *RedisStore) normalizeZSet(value any) ([]redis.Z, error) {
 	case []ZMember:
 		result := make([]redis.Z, 0, len(typed))
 		for _, item := range typed {
+			if math.IsNaN(item.Score) || math.IsInf(item.Score, 0) {
+				return nil, errors.Errorf("ZSet缓存score必须是有限数")
+			}
 			member, err := s.encodeRedisValue(item.Member)
 			if err != nil {
 				return nil, errors.Tag(err)
@@ -1495,6 +1610,9 @@ func (s *RedisStore) normalizeZSet(value any) ([]redis.Z, error) {
 	case map[string]float64:
 		result := make([]redis.Z, 0, len(typed))
 		for member, score := range typed {
+			if math.IsNaN(score) || math.IsInf(score, 0) {
+				return nil, errors.Errorf("ZSet缓存score必须是有限数")
+			}
 			result = append(result, redis.Z{Score: score, Member: member})
 		}
 		return result, nil
@@ -1526,11 +1644,6 @@ func defaultEncoder(value any) (string, error) {
 	return string(body), nil
 }
 
-// jitterDuration 给基础 TTL 增加抖动，降低同一类 key 同时过期导致的缓存雪崩。
-func jitterDuration(base time.Duration, jitter time.Duration) time.Duration {
-	return jitterDurationWithDefault(base, jitter, 0.1)
-}
-
 // jitterDurationWithDefault 给基础 TTL 增加抖动；未传显式 jitter 时按默认比例计算。
 func jitterDurationWithDefault(base time.Duration, jitter time.Duration, defaultRatio float64) time.Duration {
 	if base <= 0 {
@@ -1542,14 +1655,15 @@ func jitterDurationWithDefault(base time.Duration, jitter time.Duration, default
 		}
 		jitter = time.Duration(float64(base) * defaultRatio)
 	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	if jitter > maxDuration-base {
+		jitter = maxDuration - base
+	}
 	if jitter <= 0 {
-		jitter = time.Nanosecond
+		return base
 	}
-	var seed uint64
-	if err := binary.Read(rand.Reader, binary.LittleEndian, &seed); err != nil {
-		seed = uint64(time.Now().UnixNano())
-	}
-	return base + time.Duration(seed%uint64(jitter))
+	// #nosec G404 -- TTL 抖动只用于分散过期时间，不生成锁 owner 或其它安全凭据。
+	return base + time.Duration(randv2.Int64N(int64(jitter)))
 }
 
 // ttlMilliseconds 把 Go TTL 转换成 Redis PEXPIRE 使用的毫秒值，并向上保留亚毫秒 TTL。
