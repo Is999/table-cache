@@ -19,7 +19,7 @@
 
 ## 版本要求
 
-- 源码兼容 Go 1.26+；生产构建使用 Go 1.26.5+
+- Go 1.22+
 - Redis 6.2+，推荐 Redis 7+
 - 依赖 `go-redis`、Prometheus client、`go-utils` 等基础库
 
