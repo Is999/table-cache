@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.5
 
 require (
-	github.com/Is999/go-utils v1.26.0
+	github.com/Is999/go-utils v1.26.27
 	github.com/alicebob/miniredis/v2 v2.38.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
